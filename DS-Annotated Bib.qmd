@@ -20,23 +20,22 @@ The Berkeley Lab data center report gives context as well as insite into the sca
 My data comes from FERC, which I access through PUDL's cleaned version. I cite both, since PUDL is what I query but FERC collects the data and defines every variable.
 
 
-**Borenstein, S., & Bushnell, J. (2015).** "The US Electricity Industry After 20 Years of Restructuring." *Annual Review of Economics* 7: 437–463. <https://doi.org/10.1146/annurev-economics-080614-115630·> Free PDF: (https://bushnell.ucdavis.edu/uploads/7/6/9/5/76951361/electricityindustry.pdf)
+**Borenstein, S., & Bushnell, J. (2015).** "The US Electricity Industry After 20 Years of Restructuring." *Annual Review of Economics* 7: 437–463. <https://doi.org/10.1146/annurev-economics-080614-115630·> [Free PDF](https://bushnell.ucdavis.edu/uploads/7/6/9/5/76951361/electricityindustry.pdf)
 A 26-page survey of how US electricity markets got to their current structure, covering both the wholesale and retail sides. My general orientation and my source for terminology.
 
-**Andonov, A., & Rauh, J. (2024).** "The Shifting Finance of Electricity Generation." NBER Working Paper 32733. https://www.nber.org/papers/w32733
+**Andonov, A., & Rauh, J. (2024).** "The Shifting Finance of Electricity Generation." NBER Working Paper 32733. <https://www.nber.org/papers/w32733>
 Uses FERC EQR data from 2013–2020 combined with EIA plant data to show that private equity and institutional investors now own a large share of US generation, and that these owners use shorter contracts with more flexible pricing than traditional utilities. My example of what this data can support.
 
-**Bushnell, J., Mansur, E. T., & Saravia, C. (2008).** "Vertical Arrangements, Market Structure, and Competition: An Analysis of Restructured US Electricity Markets." *American Economic Review* 98(1): 237–266. <https://doi.org/10.1257/aer.98.1.237·> Free PDF: (https://bushnell.ucdavis.edu/uploads/7/6/9/5/76951361/vertical-arrangements.pdf) 
+**Bushnell, J., Mansur, E. T., & Saravia, C. (2008).** "Vertical Arrangements, Market Structure, and Competition: An Analysis of Restructured US Electricity Markets." *American Economic Review* 98(1): 237–266. <https://doi.org/10.1257/aer.98.1.237·> [Free PDF](https://bushnell.ucdavis.edu/uploads/7/6/9/5/76951361/vertical-arrangements.pdf) 
 Finds that firms with long-term contracts have less incentive to raise wholesale prices, and that ignoring these arrangements badly distorts predictions about market outcomes. Evidence that the contract variables in my data reflect real economic behavior.
 
-**Shehabi, A., et al. (2024).** *2024 United States Data Center Energy Usage Report.* Lawrence Berkeley National Laboratory, LBNL-2001637. <https://eta-publications.lbl.gov/sites/default/files/2024-12/lbnl-2024-united-states-data-center-energy-usage-report_1.pdf> Estimates that US data centers used 176 TWh in 2023 — 4.4% of national electricity consumption, nearly double 2018 — and projects 325–580 TWh by 2028. Context for how quickly demand is changing, and a benchmark for any large-buyer analysis.
+**Shehabi, A., et al. (2024).** *2024 United States Data Center Energy Usage Report.* Lawrence Berkeley National Laboratory, LBNL-2001637. <https://eta-publications.lbl.gov/sites/default/files/2024-12/lbnl-2024-united-states-data-center-energy-usage-report_1.pdf> Estimates that US data centers used 176 TWh in 2023, 4.4% of national electricity consumption, nearly double 2018, and projects 325–580 TWh by 2028. Context for how quickly demand is changing, and a benchmark for any large-buyer analysis.
 
 **Catalyst Cooperative.** *The Public Utility Data Liberation Project (PUDL).*
-DOI: <10.5281/zenodo.3653158·> 
-Documentation:
-(https://docs.catalyst.coop/pudl/en/latest/data_sources/ferceqr.html)
+DOI: 10.5281/zenodo.3653158 
+[Documentation](https://docs.catalyst.coop/pudl/en/latest/data_sources/ferceqr.html)
 The cleaned, Parquet-formatted version of the EQR data that I query, covering
 2013q3 through 2026q2. Released in February 2026.
 
 **US Federal Energy Regulatory Commission.** *Electric Quarterly Reports (FERC Form No. 920).* <https://www.ferc.gov/power-sales-and-markets/electric-quarterly-reports-eqr>
-The original government collection and my primary data source. I use the EQR Data Dictionary (https://ferc.gov/docs-filing/eqr/order770/data-dictionary.pdf) as the definition of every variable in my analysis.
+The original government collection and my primary data source. I use the [EQR Data Dictionary](https://ferc.gov/docs-filing/eqr/order770/data-dictionary.pdf) as the definition of every variable in my analysis.

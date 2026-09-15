@@ -1,0 +1,42 @@
+---
+title: "DS-Annotated Bib"
+author: "Ian Palmer"
+format: pdf
+editor: visual
+---
+
+## Sources
+
+So far my sources do three different jobs: provide background into energy economics, give insite on how to possible use/work with this data, and lastly guide me to what research in energy contracts look like and explore what might be interesting. I have not yet looked for sources to directly supplemenmt my research question or topic as I have not quite landed on one yet. So this is just exploratory/informational for now!
+
+Borenstein and Bushnell (2015) is my background reading: I have no coursework in energy economics, so I'm using it as an initial source to learn how the industry is structured and to get definitions for terms I need. I have also reached out to my advisor to ask if there is a better textbook or source that I could use for this purpose.
+
+Andonov and Rauh (2024) provides a idea for what this dataset can actually do. They use the same FERC data I'm using, and I'm reading it mainly for method, what they filtered, what they merged it with, and what they left out. However, it is important to note that this paper was published before the PUBL cleaned version of the dataset was released, meaning there is likely differences in the data. 
+
+Bushnell, Mansur, and Saravia (2008) gives insite into why contract length is worth looking at in the first place: they show that whether a firm holds long-term contracts changes how it behaves in the market, which suggests the contract terms in my data are measuring something real about firm behavior rather than just paperwork. 
+
+The Berkeley Lab data center report gives context as well as insite into the scale of recent demand growth and real numbers to compare against if I end up looking at large buyers. 
+
+My data comes from FERC, which I access through PUDL's cleaned version. I cite both, since PUDL is what I query but FERC collects the data and defines every variable.
+
+
+**Borenstein, S., & Bushnell, J. (2015).** "The US Electricity Industry After 20 Years of Restructuring." *Annual Review of Economics* 7: 437–463. https://doi.org/10.1146/annurev-economics-080614-115630· Free PDF: https://bushnell.ucdavis.edu/uploads/7/6/9/5/76951361/electricityindustry.pdf
+A 26-page survey of how US electricity markets got to their current structure, covering both the wholesale and retail sides. My general orientation and my source for terminology.
+
+**Andonov, A., & Rauh, J. (2024).** "The Shifting Finance of Electricity Generation." NBER Working Paper 32733. https://www.nber.org/papers/w32733
+Uses FERC EQR data from 2013–2020 combined with EIA plant data to show that private equity and institutional investors now own a large share of US generation, and that these owners use shorter contracts with more flexible pricing than traditional utilities. My example of what this data can support.
+
+**Bushnell, J., Mansur, E. T., & Saravia, C. (2008).** "Vertical Arrangements, Market Structure, and Competition: An Analysis of Restructured US Electricity Markets." *American Economic Review* 98(1): 237–266. https://doi.org/10.1257/aer.98.1.237· Free PDF: https://bushnell.ucdavis.edu/uploads/7/6/9/5/76951361/vertical-arrangements.pdf 
+Finds that firms with long-term contracts have less incentive to raise wholesale prices, and that ignoring these arrangements badly distorts predictions about market outcomes. Evidence that the contract variables in my data reflect real economic behavior.
+
+**Shehabi, A., et al. (2024).** *2024 United States Data Center Energy Usage Report.* Lawrence Berkeley National Laboratory, LBNL-2001637. https://eta-publications.lbl.gov/sites/default/files/2024-12/lbnl-2024-united-states-data-center-energy-usage-report_1.pdf Estimates that US data centers used 176 TWh in 2023 — 4.4% of national electricity consumption, nearly double 2018 — and projects 325–580 TWh by 2028. Context for how quickly demand is changing, and a benchmark for any large-buyer analysis.
+
+**Catalyst Cooperative.** *The Public Utility Data Liberation Project (PUDL).*
+DOI: 10.5281/zenodo.3653158· 
+Documentation:
+https://docs.catalyst.coop/pudl/en/latest/data_sources/ferceqr.html
+The cleaned, Parquet-formatted version of the EQR data that I query, covering
+2013q3 through 2026q2. Released in February 2026.
+
+**US Federal Energy Regulatory Commission.** *Electric Quarterly Reports (FERC Form No. 920).* https://www.ferc.gov/power-sales-and-markets/electric-quarterly-reports-eqr
+The original government collection and my primary data source. I use the EQR Data Dictionary (https://ferc.gov/docs-filing/eqr/order770/data-dictionary.pdf) as the definition of every variable in my analysis.

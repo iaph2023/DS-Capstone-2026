@@ -1,0 +1,337 @@
+---
+title: "Section 4. Getting the Data: Working with 100 GB from a Laptop"
+author: "Ian Palmer"
+date: today
+format: pdf
+execute:
+  warning: false
+  message: false
+  cache: true
+---
+
+
+```{r setup}
+library(duckdb)   # query engine; reads files over the web
+library(DBI)      # how R talks to a database
+library(dplyr)
+library(ggplot2)
+
+con <- dbConnect(duckdb())          # runs inside this R session, no server
+dbExecute(con, "INSTALL httpfs;")   # add-on for reading files over the internet
+dbExecute(con, "LOAD httpfs;")      # turn it on for this session
+
+BASE <- "https://s3.us-west-2.amazonaws.com/pudl.catalyst.coop/ferceqr"
+
+# Address of one file: one table, one quarter.
+eqr <- function(table, yq) sprintf("%s/%s/%s.parquet", BASE, table, yq)
+
+# Several addresses as a list: c("a","b") -> ['a','b']
+flist <- function(urls) paste0("['", paste(urls, collapse = "','"), "']")
+
+# All 52 quarters, 2013 Q3 to 2026 Q2.
+ALL_Q <- c("2013q3", "2013q4",
+           paste0(rep(2014:2025, each = 4), "q", 1:4),
+           "2026q1", "2026q2")
+
+# Prints how long a query took.
+timed <- function(expr) {
+  t0 <- Sys.time(); res <- expr
+  message(sprintf("  elapsed: %.1f sec",
+                  as.numeric(difftime(Sys.time(), t0, units = "secs"))))
+  res
+}
+
+# One address needs quotes in SQL; a list already has its own.
+#   c_url -> read_parquet('%s')     all_c -> read_parquet(%s)
+
+# The quarter used for most single-quarter examples below.
+# Change this one line to re-run the section on a different quarter.
+EX_Q <- "2024q1"
+
+c_url  <- eqr("core_ferceqr__contracts", EX_Q)
+t_url  <- eqr("core_ferceqr__transactions", EX_Q)
+all_c  <- flist(eqr("core_ferceqr__contracts", ALL_Q))
+```
+
+## 4.1 Where the data lives
+
+PUDL does not distribute the EQR as one file or as a database you log into. It is a set of Apache Parquet files in public cloud storage, one file per table per quarter:
+
+```
+s3://pudl.catalyst.coop/ferceqr/<table>/<yyyyqQ>.parquet
+```
+
+Four tables and 52 quarters, 2013 Q3 through 2026 Q2, so a little over 200 files. The storage is public and needs no account or credentials.
+
+This bypasses the download step for working with the data. You write a query that names the files you want, it runs against the copies in cloud storage, and a result comes back. For most of the work in this project I never had the data on my own machine at all.
+
+The engine doing that is DuckDB, which runs inside the R session rather than as a separate server you have to install and connect to. Its `httpfs` extension lets it read files over the web, so `read_parquet()` takes a URL where it would normally take a file path, and nothing is written to disk. Everything that follows is ordinary SQL, sent from R with `dbGetQuery()` and coming back as a data frame.
+
+## 4.2 Why the file format matters
+
+A file is a one-dimensional sequence of bytes and a table is two-dimensional, so the format has to pick an order. A CSV writes one whole row, then the next. Parquet writes one whole column, then the next, and records in a footer where each column starts.
+
+Two things follow from there. A query that names four of twenty-seven columns moves roughly four columns' worth of data instead of the whole file. And because identical values end up next to each other, columns that repeat the same value compress very well.
+
+Combined with the quarterly split, that gives two kinds of free subsetting: by time, because time is the partition, and by column, because columns are the storage order. Everything else means reading a column to find the rows you want, which is slower but still perfectly workable at this size.
+
+One consequence worth knowing right away: row counts come from the Parquet footer rather than the data, so counting rows is almost instant even on the 80 GB transactions table.
+
+```{r row-count}
+# ASKS: how many rows in one quarter of transactions?
+
+#   SELECT = what to return, count(*) = how many rows, AS = rename it
+#   FROM read_parquet('...') = treat this file as a table
+#   sprintf() drops the file address into the %s slot
+timed(dbGetQuery(con, sprintf(
+  "SELECT count(*) AS n_rows
+     FROM read_parquet('%s')", t_url)))
+```
+
+One quarter of the transactions table holds 143,323,121 rows, and counting them took 2.3 seconds. Counting is fast because it never touches the data: each Parquet file stores a summary of its own contents, so DuckDB reads that rather than the rows. This is worth knowing early, because it means you can always check how big something is before deciding whether to query it.
+
+## 4.3 Anatomy of a query
+
+Every query in this section is built from the same handful of words. Here they are one at a time, starting with the smallest query that does anything useful: show me a few rows.
+
+```{r query-smallest}
+# ASKS: what do a few rows actually look like?
+#   SELECT = which columns to return
+#   FROM read_parquet('...') = which file to treat as a table
+#   LIMIT = stop after this many rows
+#   sprintf() substitutes c_url into the %s slot, so the file address lives
+#   in one variable instead of being retyped in every query.
+
+dbGetQuery(con, sprintf(
+  "SELECT seller_company_name, term_name, class_name
+     FROM read_parquet('%s')
+    LIMIT 5", c_url))
+```
+
+Three clauses, and the last one matters more than it looks: without a `LIMIT`, that query would have tried to hand R all 199,603 rows.
+
+Now a real question. Contracts are labelled long-term or short-term, so how many of each are there?
+
+```{r query-grouped}
+# ASKS: how many contracts of each term type?
+#   WHERE = drop rows that fail a test
+#   GROUP BY 1 = one output row per value of the first selected column
+#   count(*) = how many rows landed in each group
+#   AS = rename a column in the output
+#   ORDER BY = sort the result
+
+dbGetQuery(con, sprintf(
+  "SELECT term_name, count(*) AS n
+     FROM read_parquet('%s')
+    WHERE term_name IS NOT NULL
+    GROUP BY 1
+    ORDER BY n DESC", c_url))
+```
+
+SQL is written in one order and executed in another, and reading it in execution order helps it make sense:
+
+| Clause | What it does | Here |
+|---|---|---|
+| `FROM` | which file to treat as a table | one quarter of contracts |
+| `WHERE` | drop rows that fail a test, one row at a time | drop rows with no term recorded |
+| `GROUP BY` | collapse the surviving rows into groups | one group per term type |
+| `SELECT` | what to return for each group | the term, and how many rows were in it |
+| `ORDER BY` | sort the result | biggest group first |
+
+Four conventions in there are worth naming, because every query below reuses them:
+
+- `count(*)` is an **aggregate**: it turns a whole group into one number. `sum()`, `avg()`, `min()` and `max()` work the same way. An aggregate needs a `GROUP BY` to tell it what the groups are.
+- `GROUP BY 1` means "group by the first thing in `SELECT`." Writing the column name again does the same thing; the number is just shorthand.
+- `AS` renames a column in the output. Without it the header is the whole expression, which gets ugly fast.
+- `WHERE` filters rows, before grouping. `HAVING` filters groups, after. Mixing the two up is the most common early mistake.
+
+Everything else in this section is those two queries with more clauses added on. The one habit worth forming now is to name your columns. `SELECT *` asks for every column, which throws away the main advantage of the format, and on the transactions table it is the difference between a query that returns in seconds and one that does not finish.
+
+## 4.4 Choosing what to read
+
+A query can ask for less data in two different ways, and they are not equally cheap. One costs nothing because the storage layout has already done the work. The other means reading a column to find out which rows you wanted.
+
+**Time costs nothing**, because time is the partition. Restricting to a period is not a filter at all, it is a choice of which files to open:
+
+```{r subset-time}
+# ASKS: how many rows in one quarter, then in all 52?
+
+dbGetQuery(con, sprintf(
+  "SELECT count(*) AS n FROM read_parquet('%s')", c_url))   # quotes: one file
+dbGetQuery(con, sprintf(
+  "SELECT count(*) AS n FROM read_parquet(%s)", all_c))     # no quotes: a list
+```
+
+One quarter of contracts holds 199,603 rows and all 52 quarters hold 9,647,330. Restricting to a period never reads a row and then discards it, because the rows that do not belong are in files that were never opened. Those numbers are also worth comparing to the transactions count above: the entire contracts table, every quarter since 2013, is under 10 million rows, while a single quarter of transactions is 143 million. When people describe this dataset as large, they mean the transactions table.
+
+Two practical notes on the time axis. The data begins in 2013 Q3, and the most recent quarter available usually lags the present by one quarter. Past filings can also be revised, sometimes years later, so a number pulled today may not match the same number pulled next year.
+
+**Columns cost nothing**, for the reason in 4.2: they are the storage order, so naming four of twenty-seven moves roughly four columns' worth of data. This is why `SELECT *` is the one thing to avoid.
+
+**Everything else is a filter**, which means reading a column to find the rows that match. At this size that is still cheap, but it is a different kind of operation and worth recognizing as one. The two filters you are most likely to want are geography and contract type.
+
+Geography is recorded as a balancing authority. Contracts carry one at each end, the point of receipt and the point of delivery; transactions carry only delivery.
+
+```{r subset-region}
+# ASKS: which delivery regions appear most often?
+# Same shape as the term query in 4.3, just a different column.
+
+ba_counts <- dbGetQuery(con, sprintf(
+  "SELECT point_of_delivery_balancing_authority AS ba, count(*) AS n
+     FROM read_parquet('%s')
+    WHERE point_of_delivery_balancing_authority IS NOT NULL
+    GROUP BY 1
+    ORDER BY n DESC
+    LIMIT 20", c_url))
+
+ba_counts
+```
+
+*[TODO: describe the top regions. Also will make more sense when previous sections on termonology are written]*
+
+
+ERCOT does not appear, because wholesale sales inside ERCOT are outside FERC's jurisdiction and are never filed. See Section 3.
+
+Contract type is spread across four categorical fields. Since the query is the same each time and only the column name changes, it is worth wrapping in a small R function rather than writing it out four times:
+
+```{r subset-categoricals}
+# ASKS: what values does a column take, and how often?
+# Same query as above, with the column, file and row limit as arguments.
+# %s takes text, %d takes a number.
+
+val_counts <- function(col, url = c_url, n = 20) {
+  dbGetQuery(con, sprintf(
+    "SELECT %s AS value, count(*) AS n
+       FROM read_parquet('%s')
+      GROUP BY 1 ORDER BY n DESC LIMIT %d", col, url, n))
+}
+
+val_counts("term_name")          # LT (a year or more) vs ST
+val_counts("class_name")         # firm, non-firm, unit power sale
+val_counts("product_type_name")  # cost-based, market-based, transmission
+val_counts("product_name")       # energy, capacity, ancillary services
+```
+
+Four queries in four lines, and the same function works on any column of any of the four tables. Counting the values in a field is the standard first move on an unfamiliar column, so this is worth keeping around.
+
+*[TODO: describe each code set]*
+
+PUDL notes that FERC's published data dictionary has been revised several times since 2013 and that the allowable values changed along the way. PUDL accepts any value that was valid in any version, which means the categories are not guaranteed to be stable across the full period. 
+
+## 4.5 Querying the big table
+
+Everything so far has used contracts, which is small enough that none of this would be necessary. Transactions is the table that makes this a 100 GB problem, and the point of this section is that nothing about the method changes.
+
+The first move on an unfamiliar table is to see what is in it without reading any of it. `DESCRIBE` returns the column names and types from the footer:
+
+```{r describe-transactions}
+# ASKS: what columns does the transactions table have, and of what type?
+#   DESCRIBE reports the schema; it reads no rows.
+
+dbGetQuery(con, sprintf(
+  "DESCRIBE SELECT * FROM read_parquet('%s')", t_url))
+```
+
+
+Now the same shape of query as before, on 143 million rows instead of 200 thousand:
+
+```{r transactions-aggregate}
+# ASKS: which delivery regions see the most transactions in one quarter?
+# Same six clauses as 4.3. The only change is the file.
+# Check the column names against the DESCRIBE output above before running.
+
+timed(dbGetQuery(con, sprintf(
+  "SELECT point_of_delivery_balancing_authority AS ba, count(*) AS n
+     FROM read_parquet('%s')
+    WHERE point_of_delivery_balancing_authority IS NOT NULL
+    GROUP BY 1
+    ORDER BY n DESC
+    LIMIT 10", t_url)))
+```
+
+
+That last point is the whole argument for the format. The query never asked for a row, only for a count per group, so DuckDB read one column out of the file and nothing else. Had this been a CSV it would have had to read all 143 million rows in full to get the same ten numbers.
+
+The practical limit is on what you ask to come back, not on what you ask it to look through. A query that groups 143 million rows into ten is fine. A query that returns 143 million rows is not, and that is the distinction the next section turns into a rule.
+
+## 4.6 A worked example: filter, aggregate, pull down
+
+To show the whole process on one question: how many contracts were active in each quarter?
+
+```{r worked-example}
+# ASKS: for every quarter, how many distinct contracts were active?
+#
+# Counting rows would be wrong. A contract is re-reported every quarter it stays
+# active, and can take several rows within one quarter. Neither ID identifies a
+# contract alone, so glue them together.
+#   CAST(x AS VARCHAR) = treat x as text,  || = glue text together
+
+counts <- dbGetQuery(con, sprintf("
+  SELECT
+    year_quarter,
+    count(DISTINCT CAST(seller_company_id_ferc AS VARCHAR)
+                   || '|' || contract_service_agreement_id) AS n_contracts
+    FROM read_parquet(%s)
+   GROUP BY 1
+   ORDER BY 1", all_c))
+
+# "2024q1" -> 2024.00, so it plots on a sensible axis
+counts <- counts |>
+  mutate(year = as.numeric(substr(year_quarter, 1, 4)) +
+                (as.numeric(substr(year_quarter, 6, 6)) - 1) / 4)
+
+ggplot(counts, aes(year, n_contracts)) +
+  annotate("rect", xmin = 2013.4, xmax = 2014.0,
+           ymin = -Inf, ymax = Inf, fill = "red", alpha = 0.10) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.2) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = NULL, y = "Contracts active",
+       title = "Active electricity contracts by quarter, 2013 to 2026") +
+  theme_minimal(base_size = 13)
+```
+
+Three decisions in that query are worth naming.
+
+The count is `count(DISTINCT ...)` on a composite key rather than `count(*)`. Contracts are restated in every quarter they stay active, and a single contract can occupy several rows within one quarter, so a plain row count measures something other than contracts. The seller ID and the service agreement ID together identify a contract; neither does alone.
+
+The aggregation happens remotely. This is the pattern the rest of the project depends on: filter and aggregate inside the query, then pull down only the result. The query reads all 52 files and returns 52 rows, so what crosses the network and enters R's memory is small enough to plot, no matter how large the files behind it were. The alternative, pulling rows into R and summarizing them there with `dplyr`, works fine on contracts and is not an option at all on transactions.
+
+And the result is not uniformly trustworthy. The series opens at 60,255 contracts in 2013 Q3 and falls to 45,563 by 2014 Q1, a drop of 24%. From 49,057 in 2018 Q1 it rises to 61,389 by 2025 Q2, an increase of 25%. The two moves are almost the same size, and the second looks like a market trend while the first does not.
+
+The reason to doubt the first is that 2013 Q3 is the opening quarter of FERC's current reporting format. Checking how many contracts from a given quarter disappear three quarters later:
+
+| From | Share gone three quarters later |
+|---|---|
+| 2013 Q3 | 45.0% |
+| 2015 Q1 | 17.9% |
+| 2019 Q1 | 9.7% |
+
+Normal turnover sits between 10 and 18 percent and the opening quarter loses 45. That is consistent with the first filings containing a one-time backlog of agreements that were cleared off the books over the following year, though I have not established the mechanism directly.
+
+The practical rule is to treat the first two quarters of the data as a separate regime rather than as the start of a series.
+
+## 4.7 Summary
+
+The method:
+
+1. Name the files you want. Time is the partition, so this is free.
+2. Name the columns you want, and never `SELECT *`.
+3. Filter and aggregate inside the query, where the data is.
+4. Pull down only the result.
+
+What that buys you, by dimension:
+
+| Dimension | How | Difficulty | Watch out for |
+|---|---|---|---|
+| Time | Choose files; it is the partition | Free | Starts 2013 Q3; runs a quarter behind; filings get revised |
+| Columns | Name them in `SELECT` | Free | Avoid `SELECT *` on transactions |
+| Delivery region | `point_of_delivery_balancing_authority` | Easy | Strings, not a join key; some values are not regions; no ERCOT |
+| Product, term, class | The categorical fields | Easy | Allowable values changed over the decade |
+| Seller and buyer | `seller_company_id_ferc`, `customer_company_name` | Varies | Sellers have an ID, buyers do not. See Section 5 |
+| State | Not available | Not possible | `contact_state` is a mailing address, not geography. See Section 5 |
+| Price | `standardized_price` | Easy to query | See Section 5 |
+
+
+```{r cleanup}
+dbDisconnect(con, shutdown = TRUE)
+```

@@ -1,0 +1,486 @@
+---
+title: "A Practical Guide to FERC's Electric Quarterly Reports"
+subtitle: "Making a newly accessible federal dataset usable"
+author: "Ian Palmer"
+date: today
+abstract: |
+  Every company that sells wholesale electricity under federal jurisdiction has
+  to report its contracts and its individual sales to the Federal Energy
+  Regulatory Commission (FERC) four times a year. These Electric Quarterly
+  Reports cover more than a decade of the U.S. wholesale market, but they have
+  been used very little in research, because FERC published them in a format
+  that was impractical to work with at scale. In February 2026 a nonprofit, the
+  Public Utility Data Liberation project (PUDL), cleaned the filings and
+  republished them in a modern format. This project is a practical guide to that
+  release. I describe what the data contains and what a single row actually
+  represents, show how to query roughly 100 GB of files from a laptop without
+  downloading them, test which variables hold up, and lay out what the dataset
+  cannot answer.
+format:
+  pdf:
+    toc: true
+    number-sections: true
+    fig-pos: "H"
+    geometry: margin=1in
+    colorlinks: true
+bibliography: references.bib
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: true
+---
+
+```{r setup}
+#| cache: false
+# The connection can't be cached, so this chunk always re-runs.
+library(duckdb)   # query engine; runs inside R and reads files over the web
+library(DBI)      # connects R to the engine
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+
+# Only open a connection if there is not a live one, so this is safe to re-run.
+if (!exists("con") || !dbIsValid(con)) {
+  con <- dbConnect(duckdb())
+  dbExecute(con, "INSTALL httpfs;")
+  dbExecute(con, "LOAD httpfs;")
+}
+
+# PUDL publishes one Parquet file per table per quarter at this address.
+BASE <- "https://s3.us-west-2.amazonaws.com/pudl.catalyst.coop/ferceqr"
+eqr  <- function(tb, yq) sprintf("%s/%s/%s.parquet", BASE, tb, yq)
+
+TABLES <- c("core_ferceqr__contracts", "core_ferceqr__transactions",
+            "core_ferceqr__quarterly_identity", "core_ferceqr__quarterly_index_pub")
+
+EX_Q  <- "2024q1"   # the quarter used for every single-quarter example
+c_url <- eqr("core_ferceqr__contracts",    EX_Q)
+t_url <- eqr("core_ferceqr__transactions", EX_Q)
+```
+
+
+# Introduction: A Dataset Nobody Can Use
+
+If you want to know what wholesale electricity costs in a place like
+Pennsylvania or California, the answer is easy to find. Regional grid operators
+like PJM and CAISO run auctions a day ahead and again in real time, and they
+publish the clearing price for every location on their system, down to
+five-minute intervals. Researchers have been using these prices for over twenty
+years. About two thirds of U.S. electricity load is served in regions with one
+of these organized markets [@ferc2024primer, p. 37].
+
+However, a public spot price does not mean most power is actually bought at that
+price. Even in PJM, the largest of these markets, the independent market monitor
+found that only 25.2 percent of real-time load in 2019 was bought on the spot
+market. Another 15.9 percent came through bilateral contracts, and the remaining
+58.9 percent was self-supply, meaning utilities serving their customers from
+generation they own [@pjm2019som].
+
+Outside the organized markets, even less is visible. In the Southeast and most
+of the West outside California, utilities usually own their generation,
+transmission and distribution together, and FERC's handbook says that there
+"wholesale physical power trading typically occurs through bilateral
+transactions" [@ferc2024primer, p. 60]. These regions do have some market
+structures, but they are narrow. The Western Energy Imbalance Market, which
+CAISO has run since 2014, only balances supply and demand in real time, and FERC
+estimates it handles "about two to three percent of the energy used to meet load
+in the participating" areas [@ferc2024primer, pp. 62, 98]. The Southeast Energy
+Exchange Market launched in November 2022 and was sent back to FERC by the D.C.
+Circuit the following July [@ferc2024primer, p. 62]. Neither one commits power
+plants, buys capacity, or replaces the contracts that utilities in those regions
+actually use to buy power. This is starting to change in the West, where CAISO's
+Extended Day-Ahead Market went live with PacifiCorp on May 1, 2026
+[@caiso2026edam], but for the period this dataset covers the description above
+holds.
+
+In plain terms, the part of the market we can see is the spot price, and the
+part we mostly cannot see is the contracts and self-supply arrangements behind
+the majority of what is bought and sold.
+
+**Why the contracts matter.** Contracts are not just a different way to buy the
+same power. They are also how new power plants get built. A developer with a
+signed agreement to sell its output for ten or twenty years can show a lender a
+predictable revenue stream, and FERC's handbook makes this link when it says
+market participants hedge to establish "a predictable cash flow to support
+financing" [@ferc2024primer, p. 129]. This means that even where spot prices
+are public, without contract data we have limited visibility into how new firms
+enter wholesale electricity markets, who they sell to, and on what terms.
+**[CHECK]** Maybe find a second source for the financing claim beyond the Primer.
+
+**Why economists care.** This gap matters for at least three areas in
+economics. The first is the study on market efficiency and restructuring,
+which asks whether moving from regulated monopolies to competitive markets
+lowered costs [@fabrizio2007markets] and whether organized markets use power
+plants more efficiently than bilateral trading [@mansur2012market;
+@cicala2022imperfect]. The second is the study on long-term contracting.
+Joskow's study of coal contracts found that contracts last longer when the buyer
+and seller have more invested in the relationship [@joskow1987contract]. In
+electricity specifically, forward contracts change how firms behave in the spot
+market, since a firm that has already sold most of its output in advance has
+less reason to push prices up [@allaz1993cournot; @bushnell2008vertical]. The
+third is the industrial organization study on bargaining between firms,
+which estimates how negotiated prices depend on what each side could get
+elsewhere [@crawford2012welfare; @grennan2013price]. Bilateral power contracts
+are a natural setting for that kind of model, but only if you can see the
+contracts. **[TODO]** I have only read Borenstein and Bushnell and Bushnell,
+Mansur and Saravia very closely. Read more of the others before
+confirming them. **[ADVISOR]** Are there better examples for the bargaining
+literature, or electricity-specific ones?
+
+## The data exists
+
+What surprised me is that these contracts are not private at all.
+
+Since 2002, and in its current form since the third quarter of 2013, every
+company selling wholesale electricity under federal jurisdiction has had to
+report its contracts and its individual sales to FERC four times a year, on Form
+No. 920, the Electric Quarterly Report (EQR) [@ferc2023filing]. The filings name
+the seller, name the buyer, describe the product, and give the price.
+
+The requirement also reaches further than I first expected. A "public utility"
+under the Federal Power Act is "any person who owns or operates facilities
+subject to the jurisdiction of the Commission," and those facilities can be
+"paper facilities, e.g., contracts, books & records" [@greenfield2018ferc101,
+slide 13]. So a trading company that owns no wires and no power plants is still
+a public utility, and it still files.
+
+To be specific about what is new: none of this data is new. FERC has published
+the filings on its own website the whole time. What changed in 2026 is not
+whether the data is public, but how hard it is to use.
+
+## So why has it been used so little?
+
+The short answer is the format. FERC distributes the EQR as zip archives inside
+zip archives of CSV files, which PUDL describes as "hundreds of gigabytes of
+nested zip files" [@lamb2026eqr]. The schema also changed across three versions
+of the data dictionary over the decade [@ferc2014dictionary;
+@ferc2017dictionary; @ferc2020dictionary], some archives are corrupt, and
+character encodings are inconsistent. Pulling one quarter was a small project.
+Pulling the full history and getting it into one consistent shape was more work
+than most researchers would take on for a dataset they could not look at first.
+
+That does not mean nobody used it. Commercial data vendors sell processed
+versions of the EQR to industry clients [@yesenergy2026eqr], so the barrier
+fell mostly on researchers and the public, who had to either pay or build the
+pipeline themselves. A small number of academic papers have built it. Andonov
+and Rauh, for example, combine EQR contracts with EIA plant data to study how
+new types of power plant owners, like private equity, contract differently from
+traditional utilities [@andonov2024shifting].
+
+More often, researchers have either worked around the EQR or used it by hand.
+Cicala is a good example of working around it. To compare bilateral trading with
+organized markets, he builds supply and demand curves for areas without a market
+from power plant production and fuel data, mainly EIA Form 923, instead of from
+contract prices [@cicala2022imperfect]. His method has since been used in other
+papers, and it shows how much can be learned without the EQR. But it estimates
+what trading should have looked like from plant costs. It does not observe the
+prices firms actually agreed to.
+
+Lawrence Berkeley National Laboratory is the main example of using it by hand.
+Their annual report on utility-scale solar is the standard reference for solar
+power purchase agreement (PPA) prices in the U.S., and the EQR is one of its main
+sources for those prices. The 2025 edition reports 546 solar PPAs since 2007,
+41 of them for 2024 [@lbnl2025solar].
+
+Overall, the data was public and people clearly wanted it, but using it at
+scale was out of reach for most researchers.
+
+In February 2026 that changed. The Public Utility Data Liberation project
+(PUDL), run by the nonprofit Catalyst Cooperative, released a processed version
+of the EQR: the same filings from 2013 Q3 on, extracted, given one consistent
+schema, and published as Apache Parquet files in public cloud storage, one file
+per table per quarter [@pudl2026ferceqr; @lamb2026eqr]. This release is what
+makes this project possible, and it is the reason the dataset is getting new
+attention now.
+
+## What PUDL changed, and what is still in the way
+
+PUDL calls its release a "minimally transformed version" of the data
+[@lamb2026eqr], and that is accurate: it fixes the format, but it does not try
+to fix the content. Section 3 describes exactly what changed.
+
+PUDL also published a field catalog: every column, its type, and a description,
+mostly copied from FERC's instructions to filers [@pudl2026dictionary]. It tells
+you a column exists. It does not tell you what a row represents, and in this
+data that matters more than you would expect. The table named `contracts` does
+not have one row per contract. A contract gets re-reported in every quarter it
+stays active, and within a single quarter it takes a separate row for each
+customer, each product, and each distinct rate. In 2024 Q1 the table has 199,603
+rows but only 57,359 distinct contracts. So someone who counts rows is off by a
+factor of about three and a half, and nothing in the output tells them.
+
+This turned out to be a pattern rather than a one-off. A field called
+`contact_state` looks like geography, but it is the filer's mailing address,
+which is why Texas ranks first on it even though most of Texas is exempt from
+filing. A third of contracts have no term recorded, which looks like missing
+data but is mostly filers correctly reporting that no term applies, with that
+distinction lost in cleaning. And a categorical field that looks stable across
+the decade quietly splits into sixteen values in 2021.
+
+None of these problems cause an error. The query runs and the number looks
+reasonable. The hard part is figuring out whether it means what the column name
+says, and that is why I decided to write a guide rather than a single analysis.
+
+## What this project does
+
+This project does four main things:
+
+First, it describes the dataset: what FERC collects and from whom, what the
+four tables contain, what a row means in each, and which variables have enough
+information to use.
+
+Second, it documents a computational method. The data is bigger than my laptop's
+memory and bigger than its disk, so the usual approach of downloading a file and
+opening it does not work. I never downloaded anything. Section 4 covers how to
+query the files where they sit, aggregate remotely, and pull down only the
+result.
+
+Third, it works through one or two real questions from the first query to a
+defensible answer, including the checks that decide whether the answer holds.
+The focus is on getting reliable estimates of basic contract characteristics,
+like how long contracts last or how many buyers a seller has, because every
+more ambitious question depends on getting those right first.
+
+Fourth (not finalizied), it includes a dashboard for exploring contract trends without writing
+code (Section 7).
+
+It also reports what I could not do. The contracts and transactions tables are
+supposed to connect, and I have not established a reliable join between them,
+which PUDL has not either. Buyers appear only as free text with no identifier,
+so following one buyer across the decade is still an open problem. Both are in
+Section 9 rather than buried.
+
+## Who this is for
+
+The first audience I have in mind is a researcher or analyst who wants to use this data and has not seen it before. For this reader, writing the query is an initial learning curve, but can be assisted with AI or reading included SQL chunks. The harder part is knowing
+what the rows mean, which fields can be trusted, and which obvious queries give
+the wrong answer. That is where most of this guide spends its time. I assume no
+energy background and build what is needed in Section 2.
+
+The second audience is policymakers, industry analysts and the general public,
+who mostly want to see trends without writing any code. This is a larger group
+than academic economists, and the dashboard in Section 7 is built for them.
+
+The guide is also written for whoever opens this dataset next.
+
+## How this is organized
+
+Section 2 explains how wholesale electricity gets bought and sold. Section 3
+describes the dataset: who files, who is exempt, what the four tables hold, and
+what a row means. Section 4 covers the computational method. Section 5 reports
+what I found when I checked the data instead of trusting it. Section 6 works
+through the examples. Section 7 describes the interactive tool. Section 8 takes
+up ethical questions. Section 9 sets out limitations and next steps.
+
+# Background: How Wholesale Electricity Gets Bought and Sold
+
+This section covers the vocabulary needed to read the rest of the paper.
+Readers with an energy background can skip to Section 3.
+
+**Wholesale is not retail.** The bill you pay at home is retail, and retail is
+not what this dataset records. Before power reaches a household it is usually
+bought at least once at wholesale, between companies. FERC puts it this way:
+"Retail service involves the sales of electricity to consumers and may involve
+retail markets; wholesale markets typically involve the sales of electricity
+among electric utilities and electricity traders before it is eventually sold
+to consumers" [@ferc2024primer, p. 33]. FERC regulates wholesale rates and not
+retail ones, and that is the whole reason this dataset exists.
+
+**A few units.** *Load* is the total demand for electricity on the grid at a
+given moment. A *megawatt* (MW) measures a rate, how much power is flowing or
+could flow right now. A *megawatt-hour* (MWh) measures an amount, one megawatt
+sustained for one hour. Energy is sold in MWh and capacity in MW, and the
+dataset uses both.
+
+**Who the players are.** On the selling side are investor-owned utilities,
+independent generators, trading companies that buy power and resell it, and
+some public entities like the Bonneville Power Administration (Section 3
+explains why a federal agency files). On the buying side are load-serving
+entities, meaning the companies responsible for actually supplying customers.
+FERC describes their three options directly: a load-serving entity serves its
+customers "through a combination of self-supply, bilateral market purchases and
+purchases from RTO/ISO markets" [@ferc2024primer, p. 53]. Self-supply means
+generating the power yourself. The other two are where this dataset lives.
+Buyers and sellers are sometimes *affiliates*, meaning they are owned by the
+same parent company, and the dataset flags these contracts.
+
+**Two structures, not two markets.** The United States is split into two
+arrangements. In roughly two thirds of the country by load, a regional
+transmission organization or independent system operator (RTO/ISO) runs
+centralized auctions: generators offer, buyers bid, and the market clears at a
+published price, first in a *day-ahead* market that schedules the next day and
+then in a *real-time* market that settles the differences as the day happens
+[@ferc2024primer, pp. 37, 66]. There are seven RTO/ISOs, and FERC regulates all
+of them except ERCOT in Texas [@ferc2024primer, p. 66]. In the rest of the
+country, utilities are typically vertically integrated, meaning they own
+generation, transmission and distribution together, and trading happens
+bilaterally [@ferc2024primer, p. 60]. In both structures, the grid is divided
+into *balancing authority areas*, each run by an entity responsible for keeping
+supply and demand matched in real time. Balancing authorities matter here
+because they are the closest thing to a location the dataset records.
+
+The important thing, and the one I had wrong at first, is that these are not
+alternatives. Bilateral contracting happens inside the organized markets too
+[@ferc2024primer, p. 53]. An RTO changes how power is dispatched and priced in
+the short run. It does not replace the agreements underneath.
+
+**What restructuring was.** The split above came out of a specific period.
+Before the 1990s most customers were served by a regulated, vertically
+integrated monopoly that did everything and recovered its costs through
+regulated rates. Between 1995 and 2002, a wave of state-level reforms separated
+those functions in many states [@borenstein2015restructuring, p. 1]. The share
+of U.S. electricity produced by independent power producers went from 1.6
+percent in 1997 to about 35 percent in 2012 [@borenstein2015restructuring,
+pp. 5-6]. The movement stopped after the California electricity crisis of
+2000-2001, and Borenstein and Bushnell describe policy since then as a halt
+rather than a reversal [@borenstein2015restructuring, p. 1].
+
+**Market-based and cost-based rates.** Even fully restructured wholesale
+markets are still regulated by FERC. Borenstein and Bushnell note that FERC "has
+applied its authority flexibly by allowing states and regions to set
+'market-based' rates," but "such authority can be revoked, however, so it is
+inaccurate to label even wholesale markets in fully restructured regions as
+'deregulated'" [@borenstein2015restructuring, p. 2]. In practice there are two
+kinds of sellers. A seller with *cost-based* rates charges prices FERC has
+approved based on its costs, the traditional way utilities were regulated. A
+seller with *market-based rate authority* can negotiate its own prices, which
+FERC allows once it finds the seller does not have market power. The EQR is part
+of the price of that freedom: it is how FERC keeps watching sellers it no longer
+sets prices for. The dataset records which kind of rate each contract falls
+under. **[CHECK]** Cite FERC's market-based rate program page and Order No. 2001
+for the link between market-based rates and EQR reporting.
+
+**What is actually sold.** Several distinct things, and the dataset tells them
+apart.
+
+*Energy* is electricity delivered, measured in megawatt-hours. *Capacity* is the
+commitment to be available, measured in megawatts, and it is bought separately
+because a system needs more generating capability than it uses on a normal day
+[@ferc2024primer, p. 72]. *Ancillary services* are the smaller products that
+keep the grid stable: regulation, which follows second-to-second changes in
+load; spinning reserve, which is generation already running and able to ramp up
+within about ten minutes; and reactive supply, which maintains voltage
+[@ferc2024primer, p. 58].
+
+*Transmission* is the right to move power over someone else's wires. Generating
+power and delivering it are separate businesses, so a buyer often contracts
+separately for transport. Two forms show up in this data. *Network service*
+allows use of the whole transmission system to move generation to specified
+loads. *Point-to-point service* reserves a fixed quantity between a point of
+receipt and a point of delivery, and can run "for durations of one hour to
+multiple years" [@ferc2024primer, p. 55]. Point of receipt and point of
+delivery are both column names in the dataset.
+
+*Firm* and *non-firm* describe how reliably the product arrives. Firm service
+commits the seller and cannot be interrupted for economic reasons. Non-firm is
+as-available, and FERC's data dictionary describes it as delivery that "may be
+interrupted for any reason or no reason, without liability on the part of either
+the buyer or seller" [@ferc2020dictionary]. Firm costs more, because the seller
+is holding capability in reserve. A third category, *unit power sale*, ties the
+delivery to specific named power plants rather than to the seller's whole
+fleet. The Energy Primer uses "firm" for electricity without defining it, so I
+take these definitions from the EQR data dictionary, which is also where the
+codes in the dataset come from.
+
+**How a deal is structured.** Bilateral power deals usually have two layers. The
+industry standard is the Edison Electric Institute Master Power Purchase and Sale
+Agreement, under which parties "may make a bilateral sale by agreeing to
+transaction-specific values for price, quantity, delivery location, and period
+of delivery," with "the terms of the transaction documented on a
+transaction-specific confirmation" [@ferc2024primer, p. 123]. So there is a
+master agreement, and then individual confirmations under it. This lines up
+with the EQR having a contracts table and a transactions table, and it is the
+clearest explanation I found of why the data is shaped the way it is.
+
+**[ADVISOR]** Section 2 is the part of this furthest from my background want to go over
+more with her to make sure nothing is missing or overstated.
+
+# The Data: FERC's Electric Quarterly Reports
+
+**[Partially drafted in a separate file. Still changing a lot.]**
+
+*Describes the dataset itself. Planned contents:*
+
+- *Who files and who is exempt: public utilities, the four-million-MWh rule for
+  munis and co-ops (exempt as sellers, but they show up as buyers), Alaska and
+  Hawaii, and ERCOT.*
+- *A timeline of major changes to the form: Order No. 2001 (2002), Orders 768
+  and 770 (current format from 2013 Q3), data dictionary versions, the PUDL
+  release (2026), and Order No. 917.*
+- *What PUDL changed compared with FERC's raw files.*
+- *The four tables, and what a row means in each. A contract row is one line of
+  one contract in one quarter, so counting rows does not count contracts.*
+- *What you can filter on easily (date, seller) and what is hard (location,
+  buyer).*
+- *Which variables carry information, including blanks that mean "does not
+  apply."*
+- *What is missing before you start: records that failed to parse, duplicates,
+  and filings that get revised.*
+
+# Getting the Data: Working with 100 GB from a Laptop
+
+**[Partially drafted in a separate file. Still changing a lot.]**
+
+*The computational methods section. Explains the Parquet format and why
+columnar storage makes a dataset this size queryable without downloading it,
+then walks through querying it remotely through DuckDB in R. Covers the
+filter-aggregate-then-pull-down pattern, with annotated code.*
+
+# What's Actually in There: Data Quality and Validation
+
+**[Not yet drafted.]**
+
+*What I found when I checked the data rather than trusting it: contracts are
+restated every quarter, some variables change because the reporting changed
+rather than the market, and some price fields hold values that cannot be
+literal. Will also test how consistent buyer names are. Ends with a list of
+which variables are trustworthy and under what conditions.*
+
+# Worked Examples: Questions This Data Can Answer
+
+**[Partially drafted.]**
+
+*One or two short analyses focused on reliable estimates of basic contract
+characteristics, such as how contract length has changed or how many buyers a
+seller has. Other candidate questions will be described as future work.*
+
+**[ADVISOR]** Which one or two to keep.
+
+# An Interactive Tool
+
+**[Not yet drafted. Scope still to be discussed.]**
+
+*A potential dashboard for exploring contract trends by region, date range and contract
+type without writing code, built for policymakers, industry analysts and the
+public.*
+
+# Ethical Considerations
+
+**[Not yet drafted.]**
+
+*Two issues: the filer identity table contains named individuals' contact
+details, and easier access to competitors' contract prices could help
+transparency or could make coordination easier.*
+
+# Limitations and Future Work
+
+**[Not yet drafted.]**
+
+*What the dataset cannot do: no plant identifiers or locations, no ERCOT, no
+retail sales. Why there is no link to other energy datasets yet. The unresolved
+join between contracts and transactions, and the lack of a buyer identifier.
+Order No. 917 (effective May 26, 2026) changes the filing system and some
+fields, so this guide documents a reporting regime that is ending.*
+
+```{r cleanup}
+#| echo: false
+#| cache: false
+dbDisconnect(con, shutdown = TRUE)
+```
+
+# References {.unnumbered}
+
+::: {#refs}
+:::

@@ -127,7 +127,7 @@ are a natural setting for that kind of model, but only if you can see the
 contracts. **[TODO]** I have only read Borenstein and Bushnell and Bushnell,
 Mansur and Saravia very closely. Read more of the others before
 confirming them. **[ADVISOR]** Are there better examples for the bargaining
-literature, or electricity-specific ones?
+literature, or electricity-specific ones? Or other areas I am missing?
 
 ## The data exists
 
@@ -458,11 +458,37 @@ public.*
 
 # Ethical Considerations
 
-**[Not yet drafted.]**
+Most of this project is methodological, but making a dataset easier to use is not always necessarily an ethically neutral act. Four main issues came up, and I will go over how I delt with each.
 
-*Two issues: the filer identity table contains named individuals' contact
-details, and easier access to competitors' contract prices could help
-transparency or could make coordination easier.*
+## Personal information in the filer identity table
+
+One of the four EQR tables, `quarterly_identity`, is a directory of the people who submit filings. It contains named individuals with their work email addresses, phone numbers, and street addresses. There are hundreds of thousands of these records across the full history.
+
+This information is lawfully public and required by the FERC. That does not mean it is appropriate for me to reproduce it. The people listed are mostly mid-level compliance staff who provided a contact for a regulatory filing, not public figures who consented to scrutinty. 
+
+I handled this by using the identity table only at the company level. Every query I ran against it returns company identifiers and company names, and none of the output in this document includes a contact name, email, phone number or street address. The one place I used a contact-level field was `contact_state`, and I used it only in aggregate, to show that it is a mailing address rather than geography. I also do not redistribute any of the data. A reader who wants it goes to PUDL, which is where I got it.
+
+## Commercially sensitive pricing
+
+The transactions table records what specific companies charged specific buyers for specific products. That is competitively sensitive information by any ordinary standard, and the point of this project is to make it easier to analyze.
+
+The standard worry about price transparency in concentrated markets is that it can facilitate tacit coordination. If sellers can observe what rivals charged and to whom, they can stop undercutting each other without ever communicating. Buyers pay more, and so do the retail customers downstream. This is not hypothetical in wholesale electricity, where the California crisis of 2000 and 2001 was driven partly by "a combination of real scarcity and generator market power" [@borenstein2015restructuring, p. 8].
+
+What makes me comfortable proceeding is that this decision was made deliberately, and not by me.
+
+FERC considered exactly how much detail to require and rejected aggregation on statutory grounds. In Order No. 2001-A the Commission concluded that "aggregated data do not provide sufficient disclosure of rates to the public" and that "section 205(c) does not allow the aggregation of this information" [@ferc2023filing, p. 26]. The operational rule follows from that: "Transaction data may not be aggregated. If the price changes even on a sub-hourly basis, a new line of transaction data must be reported for each price change; the prices cannot be averaged" [@ferc2023filing, p. 26].
+
+So the transaction-level granularity that creates the concern is not an accident of the data format. It is the deliberate product of a rulemaking in which the Commission decided that public disclosure of individual wholesale rates is what the Federal Power Act requires. I am lowering the effort needed to read data that FERC chose to publish for exactly this purpose.
+
+The realistic effect of this project is to narrow the gap between parties who can already afford commercial services built on this data and researchers, regulators and smaller participants who cannot. I think that cuts in favor of doing it, and I would rather state the reasoning than assume it.
+
+## The responsibility of writing a guide
+
+PUDL has documented this dataset's structure. There is a field catalog, access instructions in four languages, a tutorial notebook, and a public list of known problems. What does not readily exist is an account of what the data means: what a row represents, that contracts are re-reported every quarter, how the two main tables relate to each other, or which fields actually hold up under use. PUDL did characterize the tables internally, but that work sits in closed issues on their tracker rather than anywhere a new user would find it, and all four tables are still labeled "experimental and/or a work in progress."
+
+That puts this document in an awkward position. For questions about schema, a reader can check me against PUDL. For the semantic claims, which are the ones that actually determine whether an analysis is right, there is nothing to check me against. If I am wrong, a reader inherits the error with no obvious way to catch it.
+
+I have handled this by marking uncertainty throughout. Claims I verified are stated plainly, claims I believe but have not confirmed carry a marker, and open questions are listed rather than smoothed over. Where I disagree with PUDL's documentation or FERC's own materials, I say which source I am following and why. I would rather this document be visibly incomplete than quietly wrong.
 
 # Limitations and Future Work
 

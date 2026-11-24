@@ -81,6 +81,13 @@ t_url <- eqr("core_ferceqr__transactions", EX_Q)
 
 # Introduction: A Dataset Nobody Can Use
 
+::: {.callout-note title="Note on this draft"}
+Still a work in progress. **[TODO]** is something I owe, **[CHECK]** is
+something I need to verify, and **[ADVISOR]** is a question for Prof. Safavi.
+Section 7 isn't drafted yet. All numbers come from one render on the date
+above.
+:::
+
 If you want to know what wholesale electricity costs in a place like
 Pennsylvania or California, the answer is easy to find. Regional grid operators
 like PJM and CAISO run auctions a day ahead and again in real time, and they
@@ -2130,11 +2137,40 @@ naive multi-quarter aggregation wrong. It does not remove the need to
 de-duplicate, but it does put a boundary on how far back a contract can be
 restated, which at least makes the problem a bounded one.
 
-**[CHECK]** My bibliography currently cites this order as 194 FERC ¶ 61,195. I
-confirmed the Federal Register citation, the docket, the effective date and the
-field eliminations directly from the Federal Register text, but I could not
-confirm that paragraph number, so I should either verify it against the order
-itself or cite 91 FR 14306 instead.
+# Conclusion (In progress)
+
+I started this project because of a gap that seemed strange once I noticed it.
+Spot prices in organized markets are published down to five-minute intervals
+and have been studied for twenty years, while the contracts underneath most
+wholesale power are barely looked at. The data was never secret, it was just
+in a format nobody wanted to fight through, and in February 2026 PUDL took
+that excuse away.
+
+What I found is that the format was never the hard part. The hard part is that
+almost nothing in this dataset means what its column name suggests. A row in
+the contracts table is not a contract and overstates the count by a factor of
+three and a half. Half of the contracts carry no price, and the price that is
+there is uninterpretable without a unit stored in a separate column. A fifth
+of transaction quantities are negative. Counting rows measures how often a
+seller files rather than how much it trades, which is enough on its own to
+make the country look like it has no bilateral market. None of these produce
+an error; they produce numbers that look fine.
+
+Working through that let me establish three things I did not expect to.
+Weighting by energy instead of rows recovers the market structure from
+Section 2 directly from the data. The contracts and transactions tables do
+join, on seller ID, agreement ID and product, and the contracted and realized
+prices agree closely enough to confirm the join is finding the right
+contracts. And EQR sellers can be matched to EIA utilities often enough to be
+useful, with the match rate turning out to depend on whether the company owns
+generators rather than on how well the names are cleaned.
+
+The pattern behind those results matters more than any one of them. Nearly
+every finding here came from checking an assumption that turned out to be
+wrong in a way the output would never have revealed. The EQR is now accessible
+in the sense that anyone can query it, and not yet usable in the sense that
+anyone can trust what comes back. This is an attempt to close part of that gap
+for whoever opens the dataset next.
 
 
 ```{r cleanup}

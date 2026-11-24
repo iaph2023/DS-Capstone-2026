@@ -1,0 +1,2149 @@
+---
+title: "A Practical Guide to FERC's Electric Quarterly Reports"
+subtitle: "Making a newly accessible federal dataset usable"
+author: "Ian Palmer"
+date: today
+abstract: |
+  Every company that sells wholesale electricity under federal jurisdiction has
+  to report its contracts and its individual sales to the Federal Energy
+  Regulatory Commission (FERC) four times a year. These Electric Quarterly
+  Reports cover more than a decade of the U.S. wholesale market, but they have
+  been used very little in research, because FERC published them in a format
+  that was impractical to work with at scale. In February 2026 a nonprofit, the
+  Public Utility Data Liberation project (PUDL), cleaned the filings and
+  republished them in a modern format. This project is a practical guide to that
+  release. I describe what the data contains and what a single row actually
+  represents, show how to query roughly 80 GB of files from a laptop without
+  downloading them, test which variables hold up, and lay out what the dataset
+  cannot answer.
+format:
+  pdf:
+    toc: true
+    number-sections: true
+    fig-pos: "H"
+    geometry: margin=1in
+    colorlinks: true
+bibliography: references.bib
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: true
+---
+
+```{r setup}
+#| cache: false
+# The connection can't be cached, so this chunk always re-runs.
+library(duckdb)   # query engine; runs inside R and reads files over the web
+library(DBI)      # connects R to the engine
+library(dplyr)
+library(tidyr)
+library(stringr)  # name cleaning in the EIA crosswalk
+library(ggplot2)
+library(knitr)
+
+# Only open a connection if there is not a live one, so this is safe to re-run.
+if (!exists("con") || !dbIsValid(con)) {
+  con <- dbConnect(duckdb())
+  invisible(dbExecute(con, "INSTALL httpfs;"))
+  invisible(dbExecute(con, "LOAD httpfs;"))
+  invisible(dbExecute(con, "SET memory_limit='4GB';"))
+  invisible(dbExecute(con, "SET preserve_insertion_order=false;"))
+}
+
+# PUDL publishes one Parquet file per EQR table per quarter at this address.
+BASE <- "https://s3.us-west-2.amazonaws.com/pudl.catalyst.coop/ferceqr"
+eqr  <- function(tb, yq) sprintf("%s/%s/%s.parquet", BASE, tb, yq)
+
+# PUDL's other datasets, including EIA, are not partitioned: one file per table.
+PUDL <- "https://s3.us-west-2.amazonaws.com/pudl.catalyst.coop/stable"
+pudl <- function(tb) sprintf("%s/%s.parquet", PUDL, tb)
+
+# Several file addresses as a SQL list: c("a","b") -> ['a','b']
+flist <- function(urls) paste0("['", paste(urls, collapse = "','"), "']")
+
+# All 52 quarters, 2013 Q3 to 2026 Q2.
+ALL_Q <- c("2013q3", "2013q4",
+           paste0(rep(2014:2025, each = 4), "q", 1:4),
+           "2026q1", "2026q2")
+
+# Every quarter of contracts, as one list for read_parquet().
+all_c <- flist(eqr("core_ferceqr__contracts", ALL_Q))
+
+TABLES <- c("core_ferceqr__contracts", "core_ferceqr__transactions",
+            "core_ferceqr__quarterly_identity", "core_ferceqr__quarterly_index_pub")
+
+EX_Q  <- "2024q1"   # the quarter used for every single-quarter example
+c_url <- eqr("core_ferceqr__contracts",    EX_Q)
+t_url <- eqr("core_ferceqr__transactions", EX_Q)
+```
+
+
+# Introduction: A Dataset Nobody Can Use
+
+If you want to know what wholesale electricity costs in a place like
+Pennsylvania or California, the answer is easy to find. Regional grid operators
+like PJM and CAISO run auctions a day ahead and again in real time, and they
+publish the clearing price for every location on their system, down to
+five-minute intervals. Researchers have been using these prices for over twenty
+years. About two thirds of U.S. electricity load is served in regions with one
+of these organized markets [@ferc2024primer, p. 37].
+
+However, a public spot price does not mean most power is actually bought at that
+price. Even in PJM, the largest of these markets, the independent market monitor
+found that only 25.2 percent of real-time load in 2019 was bought on the spot
+market. Another 15.9 percent came through bilateral contracts, and the remaining
+58.9 percent was self-supply, meaning utilities serving their customers from
+generation they own [@pjm2019som].
+
+Outside the organized markets, even less is visible. In the Southeast and most
+of the West outside California, utilities usually own their generation,
+transmission and distribution together, and FERC's handbook says that there
+"wholesale physical power trading typically occurs through bilateral
+transactions" [@ferc2024primer, p. 60]. These regions do have some market
+structures, but they are narrow. The Western Energy Imbalance Market, which
+CAISO has run since 2014, only balances supply and demand in real time, and FERC
+estimates it handles "about two to three percent of the energy used to meet load
+in the participating" areas [@ferc2024primer, pp. 62, 98]. The Southeast Energy
+Exchange Market launched in November 2022 and was sent back to FERC by the D.C.
+Circuit the following July [@ferc2024primer, p. 62]. Neither one commits power
+plants, buys capacity, or replaces the contracts that utilities in those regions
+actually use to buy power. This is starting to change in the West, where CAISO's
+Extended Day-Ahead Market went live with PacifiCorp on May 1, 2026
+[@caiso2026edam], but for the period this dataset covers the description above
+holds.
+
+In plain terms, the part of the market we can see is the spot price, and the
+part we mostly cannot see is the contracts and self-supply arrangements behind
+the majority of what is bought and sold.
+
+**Why the contracts matter.** Contracts are not just a different way to buy the
+same power. They are also how new power plants get built. A developer with a
+signed agreement to sell its output for ten or twenty years can show a lender a
+predictable revenue stream, and FERC's handbook makes this link when it says
+market participants hedge to establish "a predictable cash flow to support
+financing" [@ferc2024primer, p. 129]. This means that even where spot prices
+are public, without contract data we have limited visibility into how new firms
+enter wholesale electricity markets, who they sell to, and on what terms.
+**[CHECK]** Maybe find a second source for the financing claim beyond the Primer.
+
+**Why economists care.** This gap matters for at least three areas in
+economics. The first is the study on market efficiency and restructuring,
+which asks whether moving from regulated monopolies to competitive markets
+lowered costs [@fabrizio2007markets] and whether organized markets use power
+plants more efficiently than bilateral trading [@mansur2012market;
+@cicala2022imperfect]. The second is the study on long-term contracting.
+Joskow's study of coal contracts found that contracts last longer when the buyer
+and seller have more invested in the relationship [@joskow1987contract]. In
+electricity specifically, forward contracts change how firms behave in the spot
+market, since a firm that has already sold most of its output in advance has
+less reason to push prices up [@allaz1993cournot; @bushnell2008vertical]. The
+third is the industrial organization study on bargaining between firms,
+which estimates how negotiated prices depend on what each side could get
+elsewhere [@crawford2012welfare; @grennan2013price]. Bilateral power contracts
+are a natural setting for that kind of model, but only if you can see the
+contracts. **[TODO]** I have only read Borenstein and Bushnell and Bushnell,
+Mansur and Saravia very closely. Read more of the others before
+confirming them. **[ADVISOR]** Are there better examples for the bargaining
+literature, or electricity-specific ones? Or other areas I am missing?
+
+## The data exists
+
+What surprised me is that these contracts are not private at all.
+
+Since 2002, and in its current form since the third quarter of 2013, every
+company selling wholesale electricity under federal jurisdiction has had to
+report its contracts and its individual sales to FERC four times a year, on Form
+No. 920, the Electric Quarterly Report (EQR) [@ferc2023filing]. The filings name
+the seller, name the buyer, describe the product, and give the price.
+
+The requirement also reaches further than I first expected. A "public utility"
+under the Federal Power Act is "any person who owns or operates facilities
+subject to the jurisdiction of the Commission," and those facilities can be
+"paper facilities, e.g., contracts, books & records" [@greenfield2018ferc101,
+slide 13]. So a trading company that owns no wires and no power plants is still
+a public utility, and it still files.
+
+To be specific about what is new: none of this data is new. FERC has published
+the filings on its own website the whole time. What changed in 2026 is not
+whether the data is public, but how hard it is to use.
+
+## So why has it been used so little?
+
+The short answer is the format. FERC distributes the EQR as zip archives inside
+zip archives of CSV files, which PUDL describes as "hundreds of gigabytes of
+nested zip files" [@lamb2026eqr]. The schema also changed across three versions
+of the data dictionary over the decade [@ferc2014dictionary;
+@ferc2017dictionary; @ferc2020dictionary], some archives are corrupt, and
+character encodings are inconsistent. Pulling one quarter was a small project.
+Pulling the full history and getting it into one consistent shape was more work
+than most researchers would take on for a dataset they could not look at first.
+
+That does not mean nobody used it. Commercial data vendors sell processed
+versions of the EQR to industry clients [@yesenergy2026eqr], so the barrier
+fell mostly on researchers and the public, who had to either pay or build the
+pipeline themselves. A small number of academic papers have built it. Andonov
+and Rauh, for example, combine EQR contracts with EIA plant data to study how
+new types of power plant owners, like private equity, contract differently from
+traditional utilities [@andonov2024shifting].
+
+More often, researchers have either worked around the EQR or used it by hand.
+Cicala is a good example of working around it. To compare bilateral trading with
+organized markets, he builds supply and demand curves for areas without a market
+from power plant production and fuel data, mainly EIA Form 923, instead of from
+contract prices [@cicala2022imperfect]. His method has since been used in other
+papers, and it shows how much can be learned without the EQR. But it estimates
+what trading should have looked like from plant costs. It does not observe the
+prices firms actually agreed to.
+
+Lawrence Berkeley National Laboratory is the main example of using it by hand.
+Their annual report on utility-scale solar is the standard reference for solar
+power purchase agreement (PPA) prices in the U.S., and the EQR is one of its main
+sources for those prices. The 2025 edition reports 546 solar PPAs since 2007,
+41 of them for 2024 [@lbnl2025solar].
+
+Overall, the data was public and people clearly wanted it, but using it at
+scale was out of reach for most researchers.
+
+In February 2026 that changed. The Public Utility Data Liberation project
+(PUDL), run by the nonprofit Catalyst Cooperative, released a processed version
+of the EQR: the same filings from 2013 Q3 on, extracted, given one consistent
+schema, and published as Apache Parquet files in public cloud storage, one file
+per table per quarter [@pudl2026ferceqr; @lamb2026eqr]. This release is what
+makes this project possible, and it is the reason the dataset is getting new
+attention now.
+
+## What PUDL changed, and what is still in the way
+
+PUDL calls its release a "minimally transformed version" of the data
+[@lamb2026eqr], and that is accurate: it fixes the format, but it does not try
+to fix the content. Section 3 describes exactly what changed.
+
+PUDL also published a field catalog: every column, its type, and a description,
+mostly copied from FERC's instructions to filers [@pudl2026dictionary]. It tells
+you a column exists. It does not tell you what a row represents, and in this
+data that matters more than you would expect. The table named `contracts` does
+not have one row per contract. A contract gets re-reported in every quarter it
+stays active, and within a single quarter it takes a separate row for each
+customer, each product, and each distinct rate. In 2024 Q1 the table has 199,603
+rows but only 57,359 distinct contracts. So someone who counts rows is off by a
+factor of about three and a half, and nothing in the output tells them.
+
+This turned out to be a pattern rather than a one-off. A field called
+`contact_state` looks like geography, but it is the filer's mailing address,
+which is why Texas ranks first on it even though most of Texas is exempt from
+filing. A third of contracts have no term recorded, which looks like missing
+data but is mostly filers correctly reporting that no term applies, with that
+distinction lost in cleaning. And a categorical field that looks stable across
+the decade quietly splits into sixteen values in 2021.
+
+None of these problems cause an error. The query runs and the number looks
+reasonable. The hard part is figuring out whether it means what the column name
+says, and that is why I decided to write a guide rather than a single analysis.
+
+## What this project does
+
+This project does four main things:
+
+First, it describes the dataset: what FERC collects and from whom, what the
+four tables contain, what a row means in each, and which variables have enough
+information to use.
+
+Second, it documents a computational method. The data is bigger than my laptop's
+memory and bigger than its disk, so the usual approach of downloading a file and
+opening it does not work. I never downloaded anything. Section 4 covers how to
+query the files where they sit, aggregate remotely, and pull down only the
+result.
+
+Third, it works through one or two real questions from the first query to a
+defensible answer, including the checks that decide whether the answer holds.
+The focus is on getting reliable estimates of basic contract characteristics,
+like how long contracts last or how many buyers a seller has, because every
+more ambitious question depends on getting those right first.
+
+Fourth (not finalizied), it includes a dashboard for exploring contract trends without writing
+code (Section 7).
+
+It also reports what I could not do. Buyers appear only as free text with no
+identifier, so following one buyer across the decade is still an open problem,
+and contract duration cannot be measured because most contracts have no
+termination date recorded. Both are in Section 9 rather than buried.
+
+## Who this is for
+
+The first audience I have in mind is a researcher or analyst who wants to use this data and has not seen it before. For this reader, writing the query is an initial learning curve, but can be assisted with AI or reading included SQL chunks. The harder part is knowing
+what the rows mean, which fields can be trusted, and which obvious queries give
+the wrong answer. That is where most of this guide spends its time. I assume no
+energy background and build what is needed in Section 2.
+
+The second audience is policymakers, industry analysts and the general public,
+who mostly want to see trends without writing any code. This is a larger group
+than academic economists, and the dashboard in Section 7 is built for them.
+
+The guide is also written for whoever opens this dataset next.
+
+## How this is organized
+
+Section 2 explains how wholesale electricity gets bought and sold. Section 3
+describes the dataset: who files, who is exempt, what the four tables hold, and
+what a row means. Section 4 covers the computational method. Section 5 reports
+what I found when I checked the data instead of trusting it. Section 6 works
+through the examples. Section 7 describes the interactive tool. Section 8 takes
+up ethical questions. Section 9 sets out limitations and next steps.
+
+# Background: How Wholesale Electricity Gets Bought and Sold
+
+This section covers the vocabulary needed to read the rest of the paper.
+Readers with an energy background can skip to Section 3.
+
+**Wholesale is not retail.** The bill you pay at home is retail, and retail is
+not what this dataset records. Before power reaches a household it is usually
+bought at least once at wholesale, between companies. FERC puts it this way:
+"Retail service involves the sales of electricity to consumers and may involve
+retail markets; wholesale markets typically involve the sales of electricity
+among electric utilities and electricity traders before it is eventually sold
+to consumers" [@ferc2024primer, p. 33]. FERC regulates wholesale rates and not
+retail ones, and that is the whole reason this dataset exists.
+
+**A few units.** *Load* is the total demand for electricity on the grid at a
+given moment. A *megawatt* (MW) measures a rate, how much power is flowing or
+could flow right now. A *megawatt-hour* (MWh) measures an amount, one megawatt
+sustained for one hour. Energy is sold in MWh and capacity in MW, and the
+dataset uses both.
+
+**Who the players are.** On the selling side are investor-owned utilities,
+independent generators, trading companies that buy power and resell it, and
+some public entities like the Bonneville Power Administration (Section 3
+explains why a federal agency files). On the buying side are load-serving
+entities, meaning the companies responsible for actually supplying customers.
+FERC describes their three options directly: a load-serving entity serves its
+customers "through a combination of self-supply, bilateral market purchases and
+purchases from RTO/ISO markets" [@ferc2024primer, p. 53]. Self-supply means
+generating the power yourself. The other two are where this dataset lives.
+Buyers and sellers are sometimes *affiliates*, meaning they are owned by the
+same parent company, and the dataset flags these contracts.
+
+**Two structures, not two markets.** The United States is split into two
+arrangements. In roughly two thirds of the country by load, a regional
+transmission organization or independent system operator (RTO/ISO) runs
+centralized auctions: generators offer, buyers bid, and the market clears at a
+published price, first in a *day-ahead* market that schedules the next day and
+then in a *real-time* market that settles the differences as the day happens
+[@ferc2024primer, pp. 37, 66]. There are seven RTO/ISOs, and FERC regulates all
+of them except ERCOT in Texas [@ferc2024primer, p. 66]. In the rest of the
+country, utilities are typically vertically integrated, meaning they own
+generation, transmission and distribution together, and trading happens
+bilaterally [@ferc2024primer, p. 60]. In both structures, the grid is divided
+into *balancing authority areas*, each run by an entity responsible for keeping
+supply and demand matched in real time. Balancing authorities matter here
+because they are the closest thing to a location the dataset records.
+
+The important thing, and the one I had wrong at first, is that these are not
+alternatives. Bilateral contracting happens inside the organized markets too
+[@ferc2024primer, p. 53]. An RTO changes how power is dispatched and priced in
+the short run. It does not replace the agreements underneath.
+
+**What restructuring was.** The split above came out of a specific period.
+Before the 1990s most customers were served by a regulated, vertically
+integrated monopoly that did everything and recovered its costs through
+regulated rates. Between 1995 and 2002, a wave of state-level reforms separated
+those functions in many states [@borenstein2015restructuring, p. 1]. The share
+of U.S. electricity produced by independent power producers went from 1.6
+percent in 1997 to about 35 percent in 2012 [@borenstein2015restructuring,
+pp. 5-6]. The movement stopped after the California electricity crisis of
+2000-2001, and Borenstein and Bushnell describe policy since then as a halt
+rather than a reversal [@borenstein2015restructuring, p. 1].
+
+**Market-based and cost-based rates.** Even fully restructured wholesale
+markets are still regulated by FERC. Borenstein and Bushnell note that FERC "has
+applied its authority flexibly by allowing states and regions to set
+'market-based' rates," but "such authority can be revoked, however, so it is
+inaccurate to label even wholesale markets in fully restructured regions as
+'deregulated'" [@borenstein2015restructuring, p. 2]. In practice there are two
+kinds of sellers. A seller with *cost-based* rates charges prices FERC has
+approved based on its costs, the traditional way utilities were regulated. A
+seller with *market-based rate authority* can negotiate its own prices, which
+FERC allows once it finds the seller does not have market power. The EQR is part
+of the price of that freedom: it is how FERC keeps watching sellers it no longer
+sets prices for. The dataset records which kind of rate each contract falls
+under. **[CHECK]** Cite FERC's market-based rate program page and Order No. 2001
+for the link between market-based rates and EQR reporting.
+
+**What is actually sold.** Several distinct things, and the dataset tells them
+apart.
+
+*Energy* is electricity delivered, measured in megawatt-hours. *Capacity* is the
+commitment to be available, measured in megawatts, and it is bought separately
+because a system needs more generating capability than it uses on a normal day
+[@ferc2024primer, p. 72]. *Ancillary services* are the smaller products that
+keep the grid stable: regulation, which follows second-to-second changes in
+load; spinning reserve, which is generation already running and able to ramp up
+within about ten minutes; and reactive supply, which maintains voltage
+[@ferc2024primer, p. 58].
+
+*Transmission* is the right to move power over someone else's wires. Generating
+power and delivering it are separate businesses, so a buyer often contracts
+separately for transport. Two forms show up in this data. *Network service*
+allows use of the whole transmission system to move generation to specified
+loads. *Point-to-point service* reserves a fixed quantity between a point of
+receipt and a point of delivery, and can run "for durations of one hour to
+multiple years" [@ferc2024primer, p. 55]. Point of receipt and point of
+delivery are both column names in the dataset.
+
+*Firm* and *non-firm* describe how reliably the product arrives. Firm service
+commits the seller and cannot be interrupted for economic reasons. Non-firm is
+as-available, and FERC's data dictionary describes it as delivery that "may be
+interrupted for any reason or no reason, without liability on the part of either
+the buyer or seller" [@ferc2020dictionary]. Firm costs more, because the seller
+is holding capability in reserve. A third category, *unit power sale*, ties the
+delivery to specific named power plants rather than to the seller's whole
+fleet. The Energy Primer uses "firm" for electricity without defining it, so I
+take these definitions from the EQR data dictionary, which is also where the
+codes in the dataset come from.
+
+**How a deal is structured.** Bilateral power deals usually have two layers. The
+industry standard is the Edison Electric Institute Master Power Purchase and Sale
+Agreement, under which parties "may make a bilateral sale by agreeing to
+transaction-specific values for price, quantity, delivery location, and period
+of delivery," with "the terms of the transaction documented on a
+transaction-specific confirmation" [@ferc2024primer, p. 123]. So there is a
+master agreement, and then individual confirmations under it. This lines up
+with the EQR having a contracts table and a transactions table, and it is the
+clearest explanation I found of why the data is shaped the way it is.
+
+**[ADVISOR]** Section 2 is the part of this furthest from my background want to go over
+more with her to make sure nothing is missing or overstated.
+
+# The Data: FERC's Electric Quarterly Reports
+
+## What the EQR is
+
+Every company that sells wholesale electricity under federal jurisdiction has
+to tell FERC what it sold, to whom, and on what terms, and it does this four
+times a year on FERC Form No. 920, the Electric Quarterly Report. The
+requirement dates to 2002 and the filing regime in its current form began in
+the third quarter of 2013, which is where the data available through PUDL
+starts.
+
+One detail about the filing obligation shapes everything downstream: it does
+not depend on activity. A utility with a tariff on file has to submit a report
+even if it made no sales at all that quarter [@ferc2023filing, p. 7]. The
+population of filers is therefore wider than the population of sellers, and
+any count of companies in this dataset is counting the former rather than the
+latter.
+
+**Who is left out.** Three exclusions shape what questions the data can
+answer, and all three are worth knowing before you start rather than after.
+Utilities located entirely in Alaska or Hawaii are exempt because they are not
+electrically connected to the contiguous grid. Non-public utilities, mainly
+cooperatives and public power agencies, file only if their wholesale sales
+exceed four million megawatt-hours a year, and sales to their own members do
+not count toward that threshold [@cfr35].
+
+The third exclusion is ERCOT, which covers most of Texas, and it is the one
+that limits this dataset most. The reason is the same electrical isolation
+that exempts Alaska and Hawaii, since ERCOT is not synchronously interconnected
+with the rest of the country, so most sales inside it never enter interstate
+commerce in the legal sense. That distinction is worth stating carefully,
+because the intuitive version of the rule is wrong. Being intrastate is not by
+itself enough to escape FERC jurisdiction, since interstate commerce has been
+read to cover a transaction even when the contracting parties and the
+electrical pathway between them sit within one state, as long as the system is
+interconnected with the interstate grid [@greenfield2018ferc101, slide 15]. The
+exemption turns on electrical isolation, not on geography.
+
+However, ERCOT is not quite fully absent, and I want to be precise about this because an
+earlier draft of mine said it was. A small number of contracts do record an
+ERCOT delivery point, presumably the limited exceptions that FERC's own
+summary hedges about. But against a market the size of Texas, which is among
+the largest wind and solar markets in the country, that is a rounding error,
+and anyone who needs ERCOT has to use ERCOT's own published data instead.
+
+## Filings get revised
+
+Filed data is not final when it is submitted. A seller must revise a quarter by
+the end of the following quarter, and must correct errors going back twelve
+quarters [@ferc2023filing, pp. 26-27]. FERC is direct about why, noting that
+many filers "do not have complete, final data for the full quarter by the EQR
+filing deadlines," particularly for sales to ISOs [@ferc2002order2001, para. 9].
+
+Nothing in the published data marks a row as revised, so a number pulled today
+may not match the same number pulled next year and there is no way to tell from
+the files which quarters moved. I spent some time treating this as a
+theoretical concern and then it happened to me. When I first wrote this section
+in October, the 2024 Q1 contracts file held 199,603 rows and the transactions
+file held 143,323,121. Re-running the identical query six weeks later returned
+199,278 and 143,442,727. Contracts lost 325 rows and transactions gained
+119,606, in a quarter that had closed two years earlier.
+
+That is a small drift in percentage terms and it is also exactly the problem.
+Nothing failed, nothing warned me, and the only reason I noticed is that I
+happened to have the old numbers written down. For a guide whose examples are
+supposed to be re-runnable, the practical response is to pin and report a
+retrieval date rather than to pretend the numbers are stable, and that is what
+I do from here on. Every figure in this thesis comes from a single render, and
+the date of that render is stated on the title page.
+
+## The four tables
+
+PUDL distributes the cleaned data as four tables, stored as one Parquet file
+per table per quarter. Table 1 gives the shape of each in a single quarter.
+
+```{r tbl-inventory}
+inventory <- lapply(TABLES, function(tb) {
+  url  <- eqr(tb, EX_Q)
+  cols <- dbGetQuery(con, sprintf(
+    "DESCRIBE SELECT * FROM read_parquet('%s')", url))
+  rows <- dbGetQuery(con, sprintf(
+    "SELECT count(*) AS n FROM read_parquet('%s')", url))
+  data.frame(Table   = sub("core_ferceqr__", "", tb),
+             Columns = nrow(cols),
+             Rows    = rows$n)
+})
+inventory <- do.call(rbind, inventory)
+
+inventory |>
+  mutate(Rows = format(Rows, big.mark = ",")) |>
+  kable(caption = "Shape of each EQR table in 2024 Q1. Both the column count and the row count come from each Parquet file's footer rather than from its contents, so this table is quick to produce even though the transactions file is roughly 1.5 GB.")
+```
+
+Two of these carry the substance. `contracts` describes agreements and
+`transactions` records what was actually sold under them.
+`quarterly_identity` is a directory of who filed and how to reach them, and
+`quarterly_index_pub` records which filers report to commercial price indices,
+which is a table with a limited future given the rule change discussed in
+Section 9.
+
+The size gap between contracts and transactions is the single most important
+practical fact about this dataset. One quarter of transactions is over seven
+hundred times the size of one quarter of contracts, and Section 4 is largely
+about how to work with a table that size without downloading it.
+
+## What a row means
+
+This is the part that took me longest to get right, and as far as I can tell it
+is not written down anywhere. The two main tables have different units of
+observation, and in neither case is it the one the table name suggests.
+
+**A transaction row is one sale, but sales are reported very finely.** FERC
+requires a new record every time the price changes, and prices "cannot be
+averaged or otherwise aggregated" before filing [@ferc2023filing, p. 26]. For a
+seller settling in an organized market that means a new row every five minutes,
+which is why one quarter runs to
+`r format(inventory$Rows[inventory$Table == "transactions"], big.mark = ",")`
+rows. Section 5 puts a number on how small the typical row is, and it is
+smaller than I expected.
+
+**A contract row is not a contract.** It is one line of one contract as
+reported in one quarter, and two separate mechanisms multiply the rows.
+
+The first is restatement. A contract is reported from the quarter service
+begins and keeps being reported "until they are terminated"
+[@ferc2023filing, p. 16]. FERC considered the alternative and rejected it
+explicitly, writing that "we reject Edison Mission's suggestion that contract
+data should be reported only in the quarter when the agreement is entered"
+[@ferc2002order2001, para. 216]. A five-year agreement therefore appears in
+twenty consecutive quarterly files.
+
+The second is line splitting. Within a single quarter, one agreement occupies
+several rows whenever it has multiple customers, multiple products, multiple
+rates, or a quantity that changes over its life. FERC's own illustration is a
+five-year contract with a different price each year, in which "the product
+(power) would be listed on five lines" [@ferc2023filing, p. 48].
+
+The consequence is that counting rows in the contracts table does not count
+contracts, and the error is not small. The two mechanisms compound, so a long
+agreement with several products gets counted once per product per quarter it
+stays alive.
+
+What works instead is counting distinct contracts, keyed on the seller's FERC
+company ID together with the service agreement ID the seller assigned. This is
+what FERC intends the agreement ID to be used for, describing it as serving
+"the dual purpose of being a unique method for identifying a particular
+contract when it is requested and a means of tracking a contract and the
+activity under a contract from quarter to quarter" [@ferc2002order2001,
+Order No. 2001-G, para. 21]. The seller ID has to come along with it, because
+nothing stops two sellers from both numbering an agreement `1`, and in practice
+many do.
+
+```{r tbl-rows-vs-contracts}
+# concat_ws rather than || is deliberate. About 2% of contract rows have no
+# seller ID, and || returns NULL if either side is NULL, which silently drops
+# those rows from count(DISTINCT). Section 5 shows what that costs.
+row_vs_contract <- dbGetQuery(con, sprintf("
+  SELECT count(*) AS rows_in_table,
+         count(DISTINCT concat_ws('|',
+                 CAST(seller_company_id_ferc AS VARCHAR),
+                 contract_service_agreement_id)) AS distinct_contracts
+    FROM read_parquet('%s')", c_url))
+
+tibble::tibble(
+  Measure = c("Rows in the table", "Distinct contracts", "Ratio"),
+  Value   = c(format(row_vs_contract$rows_in_table,      big.mark = ","),
+              format(row_vs_contract$distinct_contracts, big.mark = ","),
+              sprintf("%.1f rows per contract",
+                      row_vs_contract$rows_in_table /
+                      row_vs_contract$distinct_contracts))
+) |>
+  kable(caption = "Rows versus contracts in the 2024 Q1 contracts table. The gap here is line splitting alone, since within a single quarter each contract is restated exactly once.")
+```
+
+The ratio in Table 2 reflects only line splitting, because within one quarter
+each contract appears exactly once in restatement terms. Across the full
+history the two effects compound, and Section 5 shows what that looks like by
+stacking three quarters and measuring the duplication directly.
+
+One note on how that query is written. I build the key with `concat_ws` rather
+than with SQL's `||` operator, which is the more obvious choice. `||` returns
+NULL whenever either input is NULL, and roughly two percent of contract rows
+have no seller company ID, so the obvious version silently discards those rows
+and returns a smaller count with no warning. Section 5 measures exactly how
+many contracts that loses. I mention it here because the composite key is
+introduced here, and anyone copying this query should copy the right version
+of it.
+
+## Linking contracts to transactions
+
+The obvious question is whether you can take a contract and find the sales made
+under it, and for a long time I assumed the answer was no. FERC's filing
+requirements say that four fields must match across the two tables: seller
+company name, customer company name, FERC tariff reference, and contract
+service agreement ID [@ferc2023filing, pp. 50-51]. PUDL, however, warns that
+the company name fields are unreliable and recommends joining on company ID
+instead, and their own characterization of the contracts table concluded that
+it "does not appear to have a primary key or an easy way to link it to the
+transactions table" [@pudlissues, issue 4513]. Given that the people who built
+the cleaned dataset had looked at this and come away without a key, I did not
+expect to find one.
+
+There was also an asymmetry in PUDL's notes that I did not understand at first.
+They report that 94 to 97 percent of seller-buyer pairs appearing in
+transactions also appear in contracts, but that only about 25 percent of pairs
+in contracts appear in transactions. Most contracts, in other words, generate
+no recorded sales in a given quarter. That is not necessarily an error, and
+FERC's rules guarantee some of it, since transmission and interconnection
+agreements are contract-only products with no transaction counterpart at all
+[@ferc2023filing, p. 60], and any agreement that is signed but not drawn on in
+a quarter will sit in the contracts table with nothing beside it.
+
+The join does work, and Section 6 tests it in full. The short version is that
+the contract service agreement ID is populated on every one of the 143 million
+transaction rows in 2024 Q1, and that joining on the seller's FERC company ID,
+the agreement ID and the product name matches 99.9 percent of those rows to a
+contract filed in the same quarter. The agreement ID alone is not enough, for
+the reason given above. The seller and agreement ID together are still not
+quite enough, because of line splitting. Adding the product is what resolves
+it, since a contract row is split by product and a transaction records which
+product it was. Looked at from the other direction, about 18 percent of the
+quarter's contracts show any transaction activity, which sits close enough to
+the 25 percent PUDL reported that I take their asymmetry to be a real feature
+of the data rather than a symptom of a bad join.
+
+Two things about that result belong here rather than in Section 6. The first is
+that the key I use is not the key FERC documents, since I never use customer
+company name or tariff reference and I do use product name, which FERC's
+four-field list does not mention. A looser key is easier to satisfy, so a high
+match rate on its own would not prove much, which is why Section 6 validates
+the join against contracted prices rather than stopping at the match rate. The
+second is that everything here comes from one quarter, and until the same test
+has been run on an earlier one I would describe this as a result for 2024 Q1
+rather than as a property of the dataset.
+
+## Which variables carry information
+
+A table with `r nrow(dbGetQuery(con, sprintf("DESCRIBE SELECT * FROM read_parquet('%s')", c_url)))`
+columns does not have that many usable variables. Some are populated in nearly
+every row and some are nearly always empty, and it is worth establishing which
+is which before building anything on a field that turns out to be blank four
+times in five.
+
+```{r tbl-profile}
+cols <- dbGetQuery(con, sprintf(
+  "DESCRIBE SELECT * FROM read_parquet('%s')", c_url))
+
+# Build one count(col) and one count(DISTINCT col) for every column, then run
+# them all in a single pass rather than one query per column.
+exprs <- sprintf(
+  'count(%1$s) AS "%1$s__filled", count(DISTINCT %1$s) AS "%1$s__distinct"',
+  cols$column_name)
+
+raw <- dbGetQuery(con, sprintf(
+  "SELECT count(*) AS n_rows, %s FROM read_parquet('%s')",
+  paste(exprs, collapse = ", "), c_url))
+
+profile <- tibble::tibble(
+  Column     = cols$column_name,
+  Type       = cols$column_type,
+  `% filled` = round(100 * as.numeric(raw[1, paste0(cols$column_name, "__filled")])
+                     / raw$n_rows, 1),
+  Distinct   = as.numeric(raw[1, paste0(cols$column_name, "__distinct")])
+) |>
+  arrange(`% filled`)
+
+profile |>
+  mutate(Distinct = format(Distinct, big.mark = ",")) |>
+  kable(caption = "Every column in the contracts table, 2024 Q1, sorted by how often it is populated. The emptiest fields appear first.")
+```
+
+Table 3 splits into three groups. Twelve columns are present on every row, two
+more are nearly complete, and everything else falls away steadily from
+`term_name` at 74.7% down to `actual_termination_date` at 2.3% with no sharp
+break anywhere, so each sparse field has to be judged on its own. The distinct
+counts are informative too: `year_quarter` takes one value and carries nothing
+within a quarter, while `contract_service_agreement_id` has 51,859 values
+against 57,026 distinct contracts, confirming that sellers reuse IDs.
+
+Two absences matter. Only 26.4% of rows record a delivery balancing authority
+and 15.2% a receipt one, so most contracts do not say where the power went.
+And while execution and commencement dates are on every row,
+`contract_termination_date` is filled on 34.6%, which is why contract duration
+is left out of this thesis and discussed in Section 9 instead.
+
+Two patterns in that table are worth pulling out now, because they change how
+the categorical fields should be read.
+
+**Blank does not always mean missing.** `term_name` is empty in about a quarter
+of rows and `class_name` in more than half, and since both are marked
+unconditionally required in every version of FERC's data dictionary, the blanks
+initially looked to me like a filing failure. They are not. FERC lists `N/A` as
+an allowable *value* for both, defined as "to be used only when the other
+available Class Names do not apply," and PUDL's transform converts the string
+`N/A` to NULL [@pudlissues, issue #4850]. Filers appear to be correctly
+reporting that firmness or term does not apply to a transmission or
+interconnection agreement, and the cleaning step then erases the difference
+between "not applicable" and "never reported."
+
+The practical consequence is that `WHERE term_name IS NOT NULL` does not drop
+bad records, it drops a category. **[CHECK]** Confirm against the raw FERC CSV
+that the nulled rows do contain the literal string `N/A`.
+
+**One categorical field is really two.** `product_type_name` looks like a
+stable set of codes, but fifteen of its values are capacity reassignment
+crossed with a time zone, so `CR-PP` is Pacific Prevailing, `CR-ED` is Eastern
+Daylight, and so on. Those fifteen codes were introduced in version 3.5 of
+FERC's data dictionary, effective 2021 Q1, and before that there was only plain
+`CR` [@ferc2020dictionary]. Anyone grouping by this column across the full
+decade will see capacity reassignment volume appear to collapse in 2021 and
+fragment into sixteen pieces, with nothing having changed in the underlying
+market.
+
+## What is missing before you start
+
+Three things are absent from the files, and a reader should know about all
+three before trusting any total.
+
+**Rows that never made it through.** PUDL drops records it cannot parse.
+Roughly 0.6 percent of all EQR records, about 29 million rows, fail on CSV
+quoting errors, and a further 922,000 fail on character encoding
+[@pudlissues, issues #4928 and #4927]. Their pipeline diagnostics report
+between 0.5 and 1.8 million records rejected per quarter [@pudlissues, issue
+#5562]. 
+None of this is flagged in the output. The rows are simply not there.
+
+**Duplicates that have not been resolved.** The transactions table has no
+enforced primary key, because duplicate rows persist across the history and the
+cause has not been established. PUDL's own note says it "isn't yet clear
+whether this reflects a data quality issue in the underlying FERC EQR
+submissions or a bug in PUDL's extraction or transformation of this table"
+[@pudlissues, issue #5455].
+
+**The jurisdictional gaps** described above: ERCOT, Alaska, Hawaii, and small
+non-public utilities.
+
+None of these makes the data unusable. What they mean is that totals from this
+dataset should be read as "what was filed and successfully parsed" rather than
+as "what happened in the wholesale market," and those are different claims.
+Section 5 takes up the variables that are present but do not mean what they
+appear to mean, which is a larger problem than the one in this subsection.
+
+# Getting the Data: Working with 80 GB from a Laptop
+
+## Where the data lives
+
+PUDL does not distribute the EQR as a single file, and it does not distribute
+it as a database you log into either. It is a set of Apache Parquet files
+sitting in public cloud storage, one file per table per quarter, at addresses
+of the form
+
+```
+s3://pudl.catalyst.coop/ferceqr/<table>/<yyyyqQ>.parquet
+```
+
+Four tables across 52 quarters, 2013 Q3 through 2026 Q2, so a little over two
+hundred files in total. The storage is public, so none of this requires an
+account or credentials.
+
+What that arrangement buys you is that the download step disappears. You write
+a query naming the files you want, the query runs against the copies in cloud
+storage, and a result comes back. For most of the work in this project I never
+had the data on my own machine at all, which matters when the transactions
+table runs to roughly 80 GB across its full history and my laptop has
+considerably less free disk than that.
+
+The engine doing the work is DuckDB, which runs inside the R session rather
+than as a separate server you have to install and connect to. Its `httpfs`
+extension lets it read files over the web, so `read_parquet()` takes a URL
+where it would normally take a file path and nothing gets written to disk.
+Everything from here on is ordinary SQL, sent from R with `dbGetQuery()` and
+coming back as a data frame.
+
+## Why the file format matters
+
+A file is a one-dimensional sequence of bytes and a table is two-dimensional,
+so any file format has to choose an order. A CSV writes one whole row, then the
+next. Parquet writes one whole column, then the next, and records in a footer
+where each column begins.
+
+Two useful things follow from that choice. A query naming four of
+thirty-two columns moves roughly four columns' worth of data rather than the
+whole file, since the other twenty-eight are in stretches of the file that
+never get read. And because identical values end up stored next to each other,
+columns that repeat the same value over and over compress extremely well,
+which is most of why a dataset this size is only 80 GB.
+
+Combined with the quarterly split, that means the layout has already separated
+the data along two axes. Narrowing by time opens fewer files, and narrowing by
+column opens less of each file. Narrowing any other way means reading a column
+to find out which rows you wanted, which the next subsection takes up.
+
+One consequence is worth knowing immediately. Row counts come from the Parquet
+footer rather than from the data, so counting rows does not read the data at
+all, even on the transactions table.
+
+```{r row-count}
+# ASKS: how many rows in one quarter of transactions?
+#   SELECT = what to return, count(*) = how many rows, AS = rename it
+#   FROM read_parquet('...') = treat this file as a table
+#   sprintf() drops the file address into the %s slot
+n_tx <- dbGetQuery(con, sprintf(
+  "SELECT count(*) AS n_rows
+     FROM read_parquet('%s')", t_url))$n_rows
+
+format(n_tx, big.mark = ",")
+```
+
+One quarter of the transactions table holds
+`r format(n_tx, big.mark = ",")` rows, and the query never touches the data to
+work that out. Each Parquet file stores a summary of its own contents, so
+DuckDB reads that summary instead of the rows. This is worth knowing early,
+because it means you can always check how big something is before committing to
+querying it.
+
+## Anatomy of a query
+
+Every query in this section is built out of the same handful of words, so it is
+worth taking them one at a time, starting with the smallest query that does
+anything useful.
+
+```{r query-smallest}
+# ASKS: what do a few rows actually look like?
+#   SELECT = which columns to return
+#   FROM read_parquet('...') = which file to treat as a table
+#   LIMIT = stop after this many rows
+dbGetQuery(con, sprintf(
+  "SELECT seller_company_name, term_name, class_name
+     FROM read_parquet('%s')
+    LIMIT 5", c_url))
+```
+
+Three clauses, and the last one matters more than it looks, because without a
+`LIMIT` that query would have tried to hand R every row in the file.
+
+Now a real question. Contracts are labelled long-term or short-term, so how
+many of each are there?
+
+```{r query-grouped}
+# ASKS: how many contracts of each term type?
+#   WHERE = drop rows that fail a test
+#   GROUP BY 1 = one output row per value of the first selected column
+#   count(*) = how many rows landed in each group
+#   ORDER BY = sort the result
+dbGetQuery(con, sprintf(
+  "SELECT term_name, count(*) AS n
+     FROM read_parquet('%s')
+    WHERE term_name IS NOT NULL
+    GROUP BY 1
+    ORDER BY n DESC", c_url))
+```
+
+SQL is written in one order and executed in another, and reading it in
+execution order is what made it click for me:
+
+| Clause | What it does | Here |
+|---|---|---|
+| `FROM` | which file to treat as a table | one quarter of contracts |
+| `WHERE` | drop rows that fail a test, one row at a time | drop rows with no term recorded |
+| `GROUP BY` | collapse the surviving rows into groups | one group per term type |
+| `SELECT` | what to return for each group | the term, and how many rows were in it |
+| `ORDER BY` | sort the result | biggest group first |
+
+Four conventions in there get reused by every query below. `count(*)` is an
+**aggregate**, meaning it turns a whole group into one number, and `sum()`,
+`avg()`, `min()` and `max()` work the same way; an aggregate needs a
+`GROUP BY` to tell it what the groups are. `GROUP BY 1` means group by the
+first thing in `SELECT`, and writing the column name again does exactly the
+same thing. `AS` renames a column in the output, and without it the header is
+the whole expression, which gets ugly fast. And `WHERE` filters rows before
+grouping while `HAVING` filters groups after, which is the distinction I got
+wrong most often when I was starting.
+
+One caution on that `WHERE term_name IS NOT NULL` before moving on. It looks
+like it is dropping bad records and it is not, it is dropping a category.
+Section 5 explains why, and the short version is that FERC allows `N/A` as a
+legitimate value and PUDL converts it to NULL during cleaning, so a blank term
+usually means the concept does not apply rather than that nobody filled it in.
+
+Everything else in this section is those two queries with more clauses added
+on. The one habit worth forming now is naming your columns, because
+`SELECT *` asks for all of them, which throws away the main advantage of the
+format, and on the transactions table it is the difference between a query that
+works and one that does not.
+
+## Choosing what to read
+
+A query can narrow what it reads in two different ways, and they work
+differently. One is built into the storage layout. The other means reading a
+column to find out which rows you wanted.
+
+**Time is the partition.** Restricting to a period is not really a filter, it
+is a choice of which files to open:
+
+```{r subset-time}
+# ASKS: how many rows in one quarter, then across all 52?
+n_q  <- dbGetQuery(con, sprintf(
+  "SELECT count(*) AS n FROM read_parquet('%s')", c_url))$n   # quotes: one file
+n_all <- dbGetQuery(con, sprintf(
+  "SELECT count(*) AS n FROM read_parquet(%s)", all_c))$n     # no quotes: a list
+
+c(one_quarter = n_q, all_quarters = n_all)
+```
+
+One quarter of contracts holds `r format(n_q, big.mark = ",")` rows and all 52
+quarters hold `r format(n_all, big.mark = ",")`. Restricting to a period never
+reads a row and then discards it, because the rows that do not belong live in
+files that were never opened.
+
+Those two numbers are also worth setting against the transaction count above.
+The entire contracts table, every quarter since 2013, is under ten million
+rows, while a single quarter of transactions is over 140 million. When people
+describe this dataset as large, the transactions table is what they mean, and
+almost everything awkward about working with the EQR comes from that one table.
+
+Two practical notes on the time axis. The data begins in 2013 Q3 and the most
+recent quarter available usually lags the present by one quarter. Past filings
+also get revised, sometimes years later, which Section 3 shows happening to
+this project between October and November.
+
+**Columns are the storage order**, for the reason given above, so naming four
+of thirty-two moves roughly four columns' worth of data. This is the whole
+reason to avoid `SELECT *`.
+
+**Everything else is a filter**, which means reading a column to find the rows
+that match. That still works, but it is a different kind of operation and
+worth recognizing as one. The two filters you are most likely to want are
+geography and contract type.
+
+Geography is recorded as a balancing authority, and contracts carry one at each
+end, the point of receipt and the point of delivery, while transactions carry
+only delivery.
+
+```{r subset-region}
+# ASKS: which delivery regions appear most often in contracts?
+# Same shape as the term query above, just a different column.
+dbGetQuery(con, sprintf(
+  "SELECT point_of_delivery_balancing_authority AS ba, count(*) AS n
+     FROM read_parquet('%s')
+    WHERE point_of_delivery_balancing_authority IS NOT NULL
+    GROUP BY 1
+    ORDER BY n DESC
+    LIMIT 20", c_url))
+```
+
+**[TODO]** Describe the top regions once the terminology in Section 2 is
+settled, since the codes do not mean much before then.
+
+There is a large caveat on that query which took me a while to notice, and it
+is the reason I would not build anything important on it. Only 26.4% of
+contract rows record a delivery balancing authority at all, and 15.2% record a
+receipt one, so the table above is describing roughly a quarter of the data
+rather than all of it. The `WHERE ... IS NOT NULL` is doing far more work than
+it appears to. Section 3 has the full fill rates. Where regional questions
+matter in this thesis I use the transactions table instead, which is what
+Section 6 does.
+
+ERCOT barely appears here, and the reason is jurisdictional rather than
+technical. Most wholesale sales inside ERCOT fall outside FERC's authority
+because ERCOT is not synchronously interconnected with the rest of the
+country, so they are never filed. A small number of contracts do record an
+ERCOT delivery point, but against the size of the Texas market it is a
+rounding error. Section 3 has the detail.
+
+Contract type is spread across four categorical fields. Since the query is the
+same each time and only the column name changes, it is worth wrapping in a
+small R function rather than writing it out four times:
+
+```{r subset-categoricals}
+# ASKS: what values does a column take, and how often?
+# Same query as above, with the column, file and row limit as arguments.
+# %s takes text, %d takes a number.
+val_counts <- function(col, url = c_url, n = 20) {
+  dbGetQuery(con, sprintf(
+    "SELECT %s AS value, count(*) AS n
+       FROM read_parquet('%s')
+      GROUP BY 1 ORDER BY n DESC LIMIT %d", col, url, n))
+}
+
+val_counts("term_name")          # LT (a year or more) vs ST
+val_counts("class_name")         # firm, non-firm, unit power sale
+val_counts("product_type_name")  # cost-based, market-based, transmission
+val_counts("product_name")       # energy, capacity, ancillary services
+```
+
+Four queries in four lines, and the same function works on any column of any of
+the four tables. Counting the values in a field is the standard first move on
+an unfamiliar column, so this is worth keeping around.
+
+The four fields are smaller than they look. `term_name` has only two values,
+`class_name` three, `product_type_name` eleven and `product_name`
+thirty-two, and the first two are blank on a quarter and a half of rows
+respectively for the `N/A` reason above. **[TODO]** Describe what the main
+values in each of the four actually mean, once Section 2 has introduced the
+terminology.
+
+One thing to know about all four is that they are not stable across the full
+history. PUDL notes that FERC's published data dictionary has been revised
+several times since 2013 and that the allowable values changed along the way,
+and PUDL accepts any value that was valid in any version. Section 3 gives the
+clearest example of what that does, where fifteen capacity-reassignment codes
+appear in 2021 where there had previously been one.
+
+## Querying the big table
+
+Everything so far has used contracts, which is small enough that none of this
+machinery would be necessary. Transactions is the table that makes this a
+large-data problem, and the point of this subsection is that nothing about the
+method changes.
+
+The first move on an unfamiliar table is to see what is in it without reading
+any of it. `DESCRIBE` returns the column names and types from the footer:
+
+```{r describe-transactions}
+# ASKS: what columns does the transactions table have, and of what type?
+#   DESCRIBE reports the schema; it reads no rows at all.
+dbGetQuery(con, sprintf(
+  "DESCRIBE SELECT * FROM read_parquet('%s')", t_url))
+```
+
+Twenty-eight columns, and the ones that matter for most questions are
+`seller_company_id_ferc`, `contract_service_agreement_id`, `product_name`,
+`type_of_rate`, `point_of_delivery_balancing_authority`,
+`standardized_price` and `standardized_quantity`. The first three are what
+Section 6 uses to join transactions back to their contracts, and the last two
+are the price and volume fields that Section 5 spends most of its time
+warning about.
+
+Now the same shape of query as before, on 143 million rows instead of 200
+thousand:
+
+```{r transactions-aggregate}
+# ASKS: which delivery regions see the most transactions in one quarter?
+# Same clauses as before. The only thing that changed is the file.
+dbGetQuery(con, sprintf(
+  "SELECT point_of_delivery_balancing_authority AS ba, count(*) AS n
+     FROM read_parquet('%s')
+    WHERE point_of_delivery_balancing_authority IS NOT NULL
+    GROUP BY 1
+    ORDER BY n DESC
+    LIMIT 10", t_url))
+```
+
+That query is the whole argument for the format. It never asked for a row, only
+for a count per group, so DuckDB read one column out of the file and nothing
+else. Had this been a CSV it would have had to read all 143 million rows in
+full to produce the same ten numbers.
+
+The practical limit is on what you ask to come back, not on what you ask it to
+look through. A query that groups 143 million rows into ten is fine. A query
+that returns 143 million rows is not, and that distinction is what the next
+subsection turns into a rule.
+
+I should add one warning about the result, because it is a good example of a
+query being correct and the answer being misleading. These are transaction
+counts, and a transaction row in an organized market is a five-minute
+settlement interval while a bilateral sale can be a whole month in one row. The
+ranking above is therefore telling you which regions report most often, not
+which regions trade most. Section 5 and Section 6 both take this up, and
+Section 6 shows what the same question looks like when it is weighted by
+energy.
+
+## A worked example: filter, aggregate, pull down
+
+To show the whole process on one question: how many contracts were active in
+each quarter?
+
+```{r worked-example}
+# ASKS: for every quarter, how many distinct contracts were active?
+#
+# Counting rows would be wrong. A contract is re-reported every quarter it
+# stays active and can take several rows within one quarter, so neither the
+# row count nor either ID alone identifies a contract.
+#   CAST(x AS VARCHAR) = treat x as text
+#   concat_ws('|', a, b) = glue with a separator, skipping NULLs
+# concat_ws rather than || is deliberate: || returns NULL if either side is
+# NULL, and about 2% of rows have no seller ID, so || would silently drop
+# them from the count. Section 5 measures what that costs.
+counts <- dbGetQuery(con, sprintf("
+  SELECT year_quarter,
+         count(DISTINCT concat_ws('|',
+                 CAST(seller_company_id_ferc AS VARCHAR),
+                 contract_service_agreement_id)) AS n_contracts
+    FROM read_parquet(%s)
+   GROUP BY 1
+   ORDER BY 1", all_c))
+
+# "2024q1" -> 2024.00, so it plots on a sensible axis
+counts <- counts |>
+  mutate(year = as.numeric(substr(year_quarter, 1, 4)) +
+                (as.numeric(substr(year_quarter, 6, 6)) - 1) / 4)
+
+# Pull out the values the text below refers to, so they cannot go stale.
+pick     <- function(q) counts$n_contracts[counts$year_quarter == q]
+open_q   <- pick("2013q3"); trough <- pick("2014q1")
+y2018    <- pick("2018q1"); recent <- pick("2025q2")
+
+ggplot(counts, aes(year, n_contracts)) +
+  annotate("rect", xmin = 2013.4, xmax = 2014.0,
+           ymin = -Inf, ymax = Inf, fill = "red", alpha = 0.10) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.2) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = NULL, y = "Contracts active",
+       title = "Active electricity contracts by quarter, 2013 to 2026") +
+  theme_minimal(base_size = 13)
+```
+
+Three decisions in that query are worth naming.
+
+The count is `count(DISTINCT ...)` on a composite key rather than `count(*)`,
+for the reasons in Section 3. Contracts are restated in every quarter they stay
+active and a single contract can occupy several rows within one quarter, so a
+plain row count measures something other than contracts. The seller ID and the
+service agreement ID together identify a contract and neither does it alone.
+
+The aggregation happens remotely, and this is the pattern the rest of the
+project depends on: filter and aggregate inside the query, then pull down only
+the result. The query reads all 52 files and returns 52 rows, so what crosses
+the network and lands in R's memory is small enough to plot no matter how large
+the files behind it were. The alternative, pulling rows into R and summarizing
+them there with `dplyr`, works fine on contracts and is not an option at all on
+transactions.
+
+And the result is not uniformly trustworthy, which is the part worth dwelling
+on. The series opens at `r format(open_q, big.mark = ",")` contracts in 2013 Q3
+and falls to `r format(trough, big.mark = ",")` by 2014 Q1, a drop of
+`r round(100 * (open_q - trough) / open_q)`%. From
+`r format(y2018, big.mark = ",")` in 2018 Q1 it rises to
+`r format(recent, big.mark = ",")` by 2025 Q2, an increase of
+`r round(100 * (recent - y2018) / y2018)`%. The two moves are similar in size,
+and the second looks like a market trend while the first does not.
+
+The reason to doubt the first is that 2013 Q3 is the opening quarter of FERC's
+current reporting format. A way to check that is to ask what share of a
+quarter's contracts have disappeared three quarters later, and compare the
+opening quarter against ordinary ones.
+
+```{r churn}
+# ASKS: what share of one quarter's contracts are gone three quarters later?
+# A contract still in force gets refiled, so disappearing means it ended.
+keys <- function(q) dbGetQuery(con, sprintf("
+  SELECT DISTINCT concat_ws('|', CAST(seller_company_id_ferc AS VARCHAR),
+                  contract_service_agreement_id) AS k
+    FROM read_parquet('%s')", eqr("core_ferceqr__contracts", q)))$k
+
+churn <- function(q0, q3) round(100 * mean(!(keys(q0) %in% keys(q3))), 1)
+
+data.frame(
+  From = c("2013q3", "2015q1", "2019q1"),
+  `Share gone three quarters later` =
+    c(churn("2013q3", "2014q2"),
+      churn("2015q1", "2015q4"),
+      churn("2019q1", "2019q4")),
+  check.names = FALSE)
+```
+
+Ordinary turnover sits around ten to twenty percent and the opening quarter
+loses far more than that. That is consistent with the first filings containing
+a one-time backlog of agreements that were then cleared off the books over the
+following year, though I have not established the mechanism directly and would
+not state it as more than a plausible reading.
+
+The practical rule I would give is to treat the first two quarters of the data
+as a separate regime rather than as the start of a series.
+
+## Summary
+
+The method, in four steps:
+
+1. Name the files you want. Time is the partition.
+2. Name the columns you want, and never `SELECT *`.
+3. Filter and aggregate inside the query, where the data is.
+4. Pull down only the result.
+
+And what each dimension of the data looks like from a query:
+
+| Dimension | How | Watch out for |
+|---|---|---|
+| Time | Choose files; it is the partition | Starts 2013 Q3; runs a quarter behind; filings get revised |
+| Columns | Name them in `SELECT` | Avoid `SELECT *` on transactions |
+| Delivery region | `point_of_delivery_balancing_authority` | Recorded on only 26% of contract rows; strings, not a join key; essentially no ERCOT |
+| Product, term, class | The four categorical fields | Blanks are a category, not missing data; allowable values changed over the decade |
+| Seller and buyer | `seller_company_id_ferc`, `customer_company_name` | Sellers have an ID, buyers do not. See Sections 5 and 6 |
+| State | Not available | `contact_state` is a mailing address, not geography. See Section 5 |
+| Price | `rate` on contracts, `standardized_price` on transactions | Only half of contracts carry a rate, and the units live in a separate column. See Section 5 |
+| Contract to transaction | Seller ID, agreement ID and product | Works, but see Section 6 for the caveats |
+
+
+# What's Actually in There: Data Quality and Validation
+
+Section 3 described what the EQR contains and Section 4 showed how to query it
+without downloading any of it. This section is about the parts I got wrong on
+the way there. Many findings below started the same way: I ran a query,
+got back a number that looked reasonable, and only later found out
+that it was not measuring what I thought it was measuring.
+
+That pattern is worth taking seriously, because it is the reason a guide like
+this one is useful at all. Many of the problems in this section did not announce
+themselves. Often times no query failed, no column was obviously empty, and the
+PUDL field catalog did not readily warn you of these. A user who reads the catalog,
+writes a sensible aggregation, and reports the result will in several cases
+publish a number that is wrong by a factor of two or more, and will have no way
+of knowing. Documenting where those traps are is most of what I have to offer.
+
+I have organized the findings by the kind of mistake each one causes rather
+than going column by column, since the same underlying problem tends to turn up
+in more than one place.
+
+## A row is not a contract
+
+The first thing I tried to do with this dataset was count contracts, which
+turned out to be harder than it sounds. The contracts table for 2024 Q1 has
+199,278 rows in it, and my initial assumption was that each row was an
+agreement between a seller and a buyer. It is not, and there are two separate
+reasons why.
+
+The first is that a single agreement gets filed as one row per product and rate
+combination, which I will call line splitting. The clearest example I found was
+Allegheny Ridge Wind Farm's agreement with PJM, which appears as six separate
+rows covering energy, capacity, spinning reserve, reactive supply and voltage
+control, uplift, and a catch-all "other" category. All six share the same
+agreement ID and nothing in any individual row marks it as part of something
+larger, so if you are counting rows you have counted that one agreement six
+times.
+
+The second reason is restatement, which I think is the more dangerous of the
+two because it only shows up once you start working across quarters. A
+quarterly filing is not a list of contracts signed that quarter. Every seller
+refiles every contract that is still in force, so a ten-year power purchase
+agreement signed in 2016 shows up in all forty quarterly files that have been
+published since. Stacking quarters and counting rows counts that contract once
+per quarter.
+
+FERC's intended identifier for a contract is the seller's company ID combined
+with the agreement ID that the seller assigned to it, and neither piece is
+unique on its own. Agreement IDs in particular are free text chosen by the
+filer, and I found that the ID `1` is used by 66 different sellers and
+`ISO-NE MPSA` by another 66, so the seller ID has to be part of the
+key rather than being a nice-to-have.
+
+```{r rows-vs-contracts}
+# Three things at once: how many rows there are, how many actual contracts,
+# and how much damage the obvious way of building the key does.
+#   ||          glues text together, but returns NULL if either side is NULL
+#   concat_ws   glues text together and skips NULLs instead
+# The gap between the two key counts is contracts the first version loses.
+dbGetQuery(con, sprintf("
+  SELECT count(*) AS n_rows,
+         count(DISTINCT CAST(seller_company_id_ferc AS VARCHAR) || '|' ||
+                        contract_service_agreement_id)  AS keys_naive,
+         count(DISTINCT concat_ws('|',
+                        CAST(seller_company_id_ferc AS VARCHAR),
+                        contract_service_agreement_id)) AS keys_safe,
+         sum(CASE WHEN seller_company_id_ferc IS NULL
+                  THEN 1 ELSE 0 END)                    AS rows_no_seller
+    FROM read_parquet('%s')", c_url)) |>
+  kable(caption = "Rows, contracts, and what NULL propagation costs.")
+```
+
+The table above gives three answers at once. The quarter has 199,278 rows but only
+57,026 contracts, so the average agreement is split into about three and a half
+rows and the row count overstates the number of agreements by a factor of three.
+
+The other two columns are there because of a mistake I made early on. 4,120
+rows, just over 2% of the table, have no seller company ID recorded. When I
+first built the composite key I used SQL's `||` operator to glue the two pieces
+together, which is the obvious way to do it, and I did not realize that `||`
+returns NULL if either input is NULL. Every one of those 4,120 rows produced a
+NULL key, and `count(DISTINCT)` throws NULLs away without any warning, so the
+query ran cleanly and returned 56,205 instead of 57,026. That is 821 contracts
+quietly missing, a difference of about one and a half percent, which is small
+enough that I never would have caught it by looking at the answer. `concat_ws`
+skips the NULL rather than propagating it, which is why I use it everywhere in
+this guide. I think this is the easiest mistake to make with the EQR and the
+single hardest one to notice, because both versions return a number that looks
+perfectly sensible.
+
+The restatement problem is much larger, and it only appears once you stack
+quarters.
+
+```{r restatement}
+# One row per contract per quarter, then stack. If each quarter's file held
+# only new contracts, three quarters would give roughly three times as many
+# distinct contracts as one quarter does. It does not.
+qs <- c("2023q3", "2023q4", "2024q1")
+
+stacked <- lapply(qs, function(q) {
+  dbGetQuery(con, sprintf("
+    SELECT DISTINCT '%s' AS yq,
+           concat_ws('|', CAST(seller_company_id_ferc AS VARCHAR),
+                          contract_service_agreement_id) AS contract_key
+      FROM read_parquet('%s')", q, eqr("core_ferceqr__contracts", q)))
+}) |> bind_rows()
+
+tibble(
+  quarters           = length(qs),
+  contract_rows      = nrow(stacked),
+  distinct_contracts = n_distinct(stacked$contract_key),
+  pct_duplicated     = round(100 * (1 - n_distinct(stacked$contract_key) /
+                                        nrow(stacked)), 1)) |>
+  kable(caption = "Stacking three quarters of contracts without de-duplicating.")
+
+# How many of the three quarters does a given contract turn up in?
+stacked |>
+  count(contract_key, name = "n_quarters") |>
+  count(n_quarters, name = "n_contracts") |>
+  kable(caption = "Quarters each contract appears in.")
+```
+
+Three quarters of data produce 170,869 contract-quarter pairs but only 65,021
+distinct contracts, so 61.9% of what you would get by stacking the files is
+duplication. The second table shows why that number is so high: 51,282 of the 65,021
+contracts, which is 78.9% of them, appear in all three quarters. Only 10,455
+appear in exactly one. The EQR is much closer to a snapshot of everything
+currently in force than it is to a log of new activity, and I had the mental
+model backwards for the first several weeks of working with it.
+
+The practical consequence is that any analysis spanning more than one quarter
+needs an explicit de-duplication step, and that step is not optional or
+cosmetic. What I settled on is to take `DISTINCT` on the composite key within
+each quarter first, stack the quarters, and then take `DISTINCT` again across
+them, keeping the most recent filing in cases where I need the contract's
+terms rather than just its existence. A small share of keys, something like
+half a percent, come back with more than one contract execution date attached,
+which means the seller reused an agreement ID for a genuinely different deal.
+There is no automatic way to resolve those, so I either handle them by hand or
+drop them and say so.
+
+## Half of the contracts have no price
+
+The most obvious reason to use the EQR instead of some other dataset is that it
+reports prices, which almost nothing else at this level of detail does. It
+reports them for about half of the rows.
+
+```{r rate-fill}
+# How much of the contracts table carries a usable price at all. count(col)
+# only counts non-NULL values, so comparing it to count(*) gives a fill rate.
+dbGetQuery(con, sprintf("
+  SELECT count(*)          AS n_rows,
+         count(rate)       AS has_rate,
+         count(rate_units) AS has_units,
+         round(100.0 * count(rate) / count(*), 1) AS pct_with_rate
+    FROM read_parquet('%s')", c_url)) |>
+  kable(caption = "How many contract rows carry a price?")
+```
+
+105,463 of the 199,278 rows have a rate recorded, which works out to 52.9%. I
+was initially worried this was a reporting failure, but after looking at which
+rows are missing a price it mostly is not. The rows without one are
+overwhelmingly agreements that do not have a price in the ordinary sense:
+membership agreements, interconnection agreements, and network and
+point-to-point transmission service. A membership agreement in an RTO does not
+have a dollars-per-megawatt-hour figure attached to it, so there is nothing for
+the seller to report.
+
+That said, it still matters for anyone doing price work, because it means you
+are working with half the table and the half you keep is not a random sample of
+it. Any claim about "average contract prices in the EQR" is really a claim
+about the subset of agreements that are priced sales, and that subset skews
+toward energy and capacity products and away from transmission.
+
+The smaller number in that table bothered me more. 105,463 rows have a rate but
+only 101,292 have a rate unit, which leaves 4,171 rows reporting a price with
+no denominator attached. A rate of 45 with no unit could be $45 per megawatt
+hour or $45 per kilowatt-month, and those differ by roughly three orders of
+magnitude, so there seems to be no way to recover what was meant.
+
+## The number and its units are stored separately
+
+This brings me to the next field that brought me trouble. `rate` holds the
+price and `rate_units` holds what the price is per, and they are stored in
+separate columns with no validation linking them.
+
+```{r rate-units}
+# Printing the data frame gives plain verbatim output rather than a formatted
+# table. I do it that way here because several of the unit codes start with a
+# slash, and the table renderer mangles them badly enough to be unreadable.
+ru <- dbGetQuery(con, sprintf("
+  SELECT rate_units, count(*) AS n
+    FROM read_parquet('%s')
+   GROUP BY 1 ORDER BY n DESC", c_url))
+
+nrow(ru)
+print(head(ru, 15))
+```
+
+There are 21 distinct unit codes and the top fifteen cover 99.8% of rows, so
+the vocabulary itself is clean and well controlled, which was a pleasant
+surprise after everything else in this section. `$/MWH` accounts for 77,830
+rows and `FLAT RATE` for 9,848, and after that there is a long tail of
+capacity-style units including `$/KW-MO`, `$/MW-MO`, `$/KW-YR`, `$/MW-DAY` and
+so on, plus 97 rows still reported in `CENTS/KWH`.
+
+The consequence is that `avg(rate)` means nothing at all unless you have
+already filtered to one unit, and this is the trap I actually fell into. When I
+first compared contracted prices against realized transaction prices for
+Section 6, I averaged `rate` across every row that had one, which mixed
+dollars-per-megawatt-hour energy prices together with dollars-per-kilowatt-month
+capacity charges. Because both are small positive numbers the output looked
+entirely plausible, and it took me a while to work out why some of the ratios
+were coming back in the thousands. Every price query in this guide filters on
+`rate_units` before it does anything else, and I would recommend that anyone
+else do the same.
+
+## A fifth of transaction quantities are negative
+
+The transactions table is where the actual volume lives, and
+`standardized_quantity` is the natural column to sum if you want to know how
+much energy changed hands. Summing it directly gives the wrong answer, and I
+only discovered this because a percentage came back negative.
+
+```{r negative-quantity}
+# Roughly 20% of rows have a negative quantity. Breaking that down by rate type
+# shows whether it is a defect spread across the table or a real category.
+dbGetQuery(con, sprintf("
+  SELECT type_of_rate,
+         count(*) AS n,
+         round(100.0 * sum(CASE WHEN standardized_quantity < 0
+                           THEN 1 ELSE 0 END) / count(*), 1) AS pct_negative
+    FROM read_parquet('%s')
+   WHERE standardized_quantity IS NOT NULL
+   GROUP BY 1 ORDER BY n DESC LIMIT 10", t_url)) |>
+  kable(caption = "Where negative quantities come from.")
+```
+
+29,309,795 of the 143,442,727 transaction rows carry a negative quantity, which
+is 20.4% of the table. My first thought was that this had to be a data entry
+problem, but the table above makes it fairly clear that it is structural instead. Rows
+priced through an RTO or ISO are negative 22.3% of the time and index-priced
+rows 14.1% of the time, while rows with a fixed negotiated price are negative
+0.0% of the time. Negative quantities belong to market settlement reporting and
+essentially never appear in bilateral deals, which is too clean a split to be
+random error.
+
+What they actually represent is most likely the buy side of a settlement, where
+a participant is taking power out of the market rather than delivering it into
+it, but I want to be careful here because neither the PUDL field catalog nor
+FERC's data dictionary says so explicitly. **[TODO]** Confirm this against the
+FERC filing instructions before I state it as fact in the final draft.
+
+Regardless of the underlying reason, the practical consequence is not
+ambiguous. `sum(standardized_quantity)` returns a net position rather than a
+volume. In the regional analysis in Section 6 this produced an organized-market
+share of negative 11.2% for one balancing authority, which was obvious enough
+to catch. What worries me more is that in a region where the buy and sell sides
+happen to be less balanced, the same error would have returned something like
+45% and I would have written it up without a second thought.
+
+## Prices and quantities have impossible tails
+
+```{r price-tails}
+# What is actually in the price and quantity columns. approx_quantile is a
+# sampling-based percentile rather than an exact one, which is why it runs
+# cheaply on 143 million rows, and also why it moves slightly between runs.
+dbGetQuery(con, sprintf("
+  SELECT round(min(standardized_price), 2)                   AS p_min,
+         round(approx_quantile(standardized_price, 0.50), 2) AS p_median,
+         round(approx_quantile(standardized_price, 0.99), 2) AS p99,
+         round(max(standardized_price), 2)                   AS p_max,
+         round(approx_quantile(standardized_quantity, 0.50), 2) AS q_median,
+         round(max(standardized_quantity), 2)                AS q_max,
+         sum(CASE WHEN standardized_price < 0 THEN 1 ELSE 0 END) AS neg_price
+    FROM read_parquet('%s')", t_url)) |>
+  kable(caption = "Distribution of transaction price and quantity.")
+```
+
+The middle of the distribution looks fine. The median transaction price is
+$22.51 per megawatt hour and the 99th percentile is $188.04, both of which are
+ordinary wholesale prices and both of which gave me some confidence that the
+column means what it says it means.
+
+The tails are another matter. The minimum price in the quarter is -$9,345,732
+and the maximum is $44,675,000, and the largest single transaction quantity is
+20,865,178 MWh, which is more energy than most US states consume in a month.
+Negative prices are a real phenomenon in wholesale markets, since generators
+will sometimes pay to keep running when output is high and demand is low, so
+the 8,213,514 rows with a negative price are not by themselves suspicious. A
+price of negative nine million dollars per megawatt hour is a filing error. Any
+analysis of prices in this dataset has to trim the tails, and whatever
+threshold gets used needs to be reported alongside the result, because the
+extremes are large enough to move a mean by several orders of magnitude on
+their own.
+
+The median quantity is the other number I would pull out of that table. At 0.04
+MWh, the typical row in this table represents something like three minutes of a
+small generator's output. That single figure says more about what the
+transactions table actually is than anything in the documentation does, because
+it makes clear that a row here is not a deal in any meaningful sense. It is one
+settlement interval.
+
+## Counting rows does not measure activity
+
+This last one is really the trap that all the others are special cases of, and
+it follows directly from the median quantity above.
+
+A row in the transactions table is one reporting interval, and how long that
+interval is depends entirely on how the seller participates in the market. An
+RTO settlement gets reported every five minutes, so one seller operating under
+one market agreement can generate tens of thousands of rows in a single
+quarter. A monthly bilateral block sold at a fixed price is one row. To
+`count(*)` these are both worth exactly one.
+
+The size of the distortion surprised me. Rows priced through an RTO or ISO make
+up 128.4 million of the 132.3 million transaction rows that have a reported
+quantity, which is 97% of the table. Taken at face value that would mean the
+United States has essentially no bilateral wholesale market, which is plainly
+false, and which contradicts the market structure I described in Section 2.
+What it actually measures is that organized markets report much more often.
+Section 6 runs the same regional question weighted by energy instead of rows
+and gets a very different picture.
+
+The general rule I would give anyone picking this dataset up is that `count(*)`
+on the transactions table answers a question about filing behavior and almost
+never answers the question you meant to ask. Anything that is supposed to be
+about market activity has to be weighted by quantity, and anything weighted by
+quantity has to deal with the negative values from the previous subsection
+first.
+
+## What to trust
+
+Pulling all of this together, The table below is the summary I wish I had been handed
+at the start of this project.
+
+| Variable | Status | Condition |
+|---|---|---|
+| `seller_company_id_ferc` | Reliable | Missing on 2% of contract rows; use `concat_ws` |
+| `contract_service_agreement_id` | Reliable | Not unique without the seller ID |
+| `product_name` | Reliable | Needed as part of the contract key |
+| `rate` | Usable | Only alongside `rate_units`; absent on 47% of rows |
+| `rate_units` | Reliable | Clean 21-value vocabulary |
+| `standardized_price` | Usable | Trim the tails and report the threshold |
+| `standardized_quantity` | Usable | Handle the 20% negative rows explicitly |
+| `point_of_delivery_balancing_authority` | Usable | Frequently NULL |
+| `contact_state` | Misleading | A mailing address, not an operating location |
+| `term_name` on transactions | Unreliable | Long-term rows that are five-minute blocks |
+| `class_name` | Partial | Blank on most non-transmission products |
+| Row counts | Misleading | Measure reporting granularity, not activity |
+
+**[TODO]** Fold in the three remaining items I have results for but have not
+written up yet: the buyer name inconsistency test, the `contact_state`
+demonstration showing it is a mailing address, and the 2013 Q3 reporting
+discontinuity.
+
+# Worked Examples: Questions This Data Can Answer
+
+The previous two sections were about getting at the data and about what breaks
+once you have it. This section is the payoff, where I take three questions that
+someone would actually want to ask and work each one through end to end. All
+three run on 2024 Q1 unless I say otherwise, and all three are deliberately
+scoped so that I can defend every number in them rather than reaching for
+something more ambitious that I would have to hedge.
+
+The three questions are whether the market structure I described in Section 2
+can be recovered from the data itself, whether a transaction can be traced back
+to the contract it was sold under, and whether EQR sellers can be matched to
+their identities in EIA's datasets. The first is a check on the data against
+something already known. The second and third are both attempts at things that,
+as far as I can tell, have not been published anywhere, and in both cases the
+limits of what works turn out to be as informative as the result.
+
+## Recovering market structure from the data
+
+Section 2 described a wholesale market split between organized RTO and ISO
+markets, which cover roughly two thirds of US load, and bilateral trade, which
+dominates in the Southeast and much of the West. The transactions table should
+be able to show that directly, because `type_of_rate` records whether a sale
+was priced through an organized market or negotiated some other way, and
+`point_of_delivery_balancing_authority` records where the power was delivered.
+
+My first attempt at this counted transactions, and it failed in a way that is
+worth reporting because it is such a clean illustration of the problem from
+Section 5. Counting rows, every major region came back somewhere between 85%
+and 100% organized, including PacifiCorp East and Bonneville, which are not in
+an RTO at all. The query was correct and the answer was nonsense, because an
+RTO settlement is reported every five minutes while a bilateral block is
+reported once a month, so the row count was measuring how often each region
+files rather than what it trades.
+
+Weighting by energy instead fixes it.
+
+```{r region-volume}
+# For each delivery region: what share of its activity went through an
+# organized market, measured two different ways?
+# Positive and negative quantity are kept apart, because a fifth of rows are
+# negative (Section 5) and summing them raw gives a net position, not a volume.
+region_vol <- dbGetQuery(con, sprintf("
+  SELECT point_of_delivery_balancing_authority AS ba,
+         sum(CASE WHEN standardized_quantity > 0
+                  THEN standardized_quantity ELSE 0 END)           AS pos_mwh,
+         sum(CASE WHEN standardized_quantity < 0
+                  THEN -standardized_quantity ELSE 0 END)          AS neg_mwh,
+         sum(CASE WHEN type_of_rate = 'RTO/ISO'
+                   AND standardized_quantity > 0
+                  THEN standardized_quantity ELSE 0 END)           AS rto_pos_mwh,
+         count(*)                                                  AS n_rows,
+         sum(CASE WHEN type_of_rate = 'RTO/ISO' THEN 1 ELSE 0 END) AS rto_rows
+    FROM read_parquet('%s')
+   WHERE point_of_delivery_balancing_authority IS NOT NULL
+     AND standardized_quantity IS NOT NULL
+   GROUP BY 1
+  HAVING sum(CASE WHEN standardized_quantity > 0
+                  THEN standardized_quantity ELSE 0 END) > 0
+   ORDER BY pos_mwh DESC", t_url))
+
+# Both weightings side by side, since the gap between them is the whole point.
+region_vol |>
+  mutate(pct_rto_rows = round(100 * rto_rows / n_rows, 1),
+         pct_rto_mwh  = round(100 * rto_pos_mwh / pos_mwh, 1)) |>
+  select(ba, n_rows, pct_rto_rows, pos_mwh, pct_rto_mwh) |>
+  head(20) |>
+  kable(caption = "Organized market share by delivery region, weighted by transaction count and by delivered energy, 2024 Q1.")
+```
+
+The table above puts the two measures next to each other and they disagree almost
+everywhere. PacifiCorp East is the starkest case: 97.6% of its transactions are
+priced through an organized market but only 3.7% of its energy is. WACM goes
+from 77.8% to 10.0% and the Public Service Company of Colorado footprint from
+84.3% to 7.8%. Reading down the energy column instead of the row column, the
+regions separate into three groups that match what Section 2 described.
+
+The first group is the genuine RTOs, where both measures are high and the
+energy share lands somewhere between 75% and 85%. PJM comes in at 79.3%, MISO
+at 75.1%, ISO New England at 75.2% and NYISO at 84.6%. Even here the energy
+share is well below the transaction share, which I read as bilateral deals
+inside an RTO footprint being individually much larger than five-minute market
+settlements, so they get heavily underweighted by any row count.
+
+The second group is the West, where the balancing authority sits inside a
+real-time imbalance market but most energy still moves bilaterally. PacifiCorp
+East at 3.7%, WACM at 10.0% and PSCO at 7.8% all fall here. This is consistent
+with how the Western Energy Imbalance Market works, since it only clears
+real-time imbalances rather than serving as a full day-ahead energy market, so
+the organized share of transactions is high while the organized share of energy
+stays small. CAISO at 30.8% sits awkwardly between the first two groups, and I
+would want to look harder at how much of the energy delivered into CISO is
+imported under bilateral arrangements before saying anything confident about it.
+
+The third group is the Southeast, which has essentially no organized market at
+all and shows it on both measures. Southern Company comes back at 0.1% by
+energy, Duke at 0.0%, South Carolina at 0.0% and Carolina Power & Light East at
+0.0%.
+
+```{r region-plot}
+#| fig-cap: "Share of activity priced through an organized market in each delivery region, measured by transaction count and by delivered energy, 2024 Q1. The dashed line is where the two measures would agree. Every region falls below it. The four Southeastern authorities (SOCO, DUK, SC, CPLE) sit on top of one another at the origin."
+
+# Every region would fall on the diagonal if the two measures agreed.
+# Labels sit to the left of the points because most regions cluster against
+# the right edge, where labels placed above collide and get dropped.
+region_vol |>
+  slice_max(pos_mwh, n = 25) |>
+  mutate(pct_rto_rows = 100 * rto_rows / n_rows,
+         pct_rto_mwh  = 100 * rto_pos_mwh / pos_mwh) |>
+  ggplot(aes(pct_rto_rows, pct_rto_mwh)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_point(colour = "steelblue", size = 2) +
+  geom_text(aes(label = ba), size = 2.6, hjust = 1.2, check_overlap = TRUE) +
+  coord_equal(xlim = c(-20, 105), ylim = c(-2, 105)) +
+  labs(x = "Percent of transactions priced through an RTO/ISO",
+       y = "Percent of energy priced through an RTO/ISO") +
+  theme_minimal(base_size = 10)
+```
+
+Figure 1 shows the same comparison as a scatter, one point per region, with the
+row-count measure on the horizontal axis and the energy measure on the vertical.
+The dashed line is where the two would agree. Every region falls below it, and
+the vertical drop is the size of the overstatement.
+
+What this example does not show is anything about load or market size. Power
+gets resold as it moves between parties, so the same megawatt hour can appear
+several times and PJM's 385 million MWh is well above what PJM actually
+consumed. The shares hold up as shares; the totals are not energy consumed.
+
+## Tracing a transaction back to its contract
+
+The EQR publishes contracts and transactions as separate tables, and the
+obvious question is whether a given sale can be connected to the agreement it
+happened under. If it can, then the transactions table stops being an
+anonymous stream of prices and quantities and becomes something you can attach
+contract terms to. Before running this I expected the answer to be no, partly
+because nothing I read suggested anyone had done it and partly because the
+earlier draft of this thesis asserted it was unresolved.
+
+FERC's data dictionary says that the transaction record carries a contract
+service agreement ID, which is supposed to point back at the contract, so there
+was at least a candidate key. The first thing I checked was whether it is
+actually filled in, and it is, on all 143,442,727 transaction rows in the
+quarter. The seller ID is slightly less complete, missing on 191,363 rows, or
+0.13%.
+
+Joining on seller ID and agreement ID alone worked, in the sense that all
+10,308 distinct key combinations in the transactions table matched a contract.
+But only 57% of those keys pointed at exactly one contract row, and the rest
+pointed at as many as nine, which would multiply the data on any real join. The
+reason turned out to be the line splitting from Section 5. Allegheny Ridge Wind
+Farm's agreement with PJM is one agreement ID split across six contract rows by
+product, and since transactions also record a product, adding `product_name` to
+the key should resolve most of it.
+
+```{r join-test}
+# Collapse each table to one row per candidate key: seller, agreement and
+# product. The transactions side is the expensive step, a single pass over
+# three columns of a very large table. Everything after works on the result.
+tx2 <- dbGetQuery(con, sprintf("
+  SELECT seller_company_id_ferc, contract_service_agreement_id, product_name,
+         count(*) AS n_transactions
+    FROM read_parquet('%s')
+   WHERE contract_service_agreement_id IS NOT NULL
+   GROUP BY 1, 2, 3", t_url))
+
+# Carry a count of priced rows through, so the join can be scored on whether
+# the contract it lands on actually has a rate attached.
+ct2 <- dbGetQuery(con, sprintf("
+  SELECT seller_company_id_ferc, contract_service_agreement_id, product_name,
+         count(*)    AS n_contract_rows,
+         count(rate) AS n_with_rate
+    FROM read_parquet('%s')
+   WHERE contract_service_agreement_id IS NOT NULL
+   GROUP BY 1, 2, 3", c_url))
+
+key3 <- c("seller_company_id_ferc", "contract_service_agreement_id",
+          "product_name")
+
+# Cast the IDs to text on both sides so the join cannot fail on a type mismatch.
+fix   <- function(d) d |> mutate(across(all_of(key3[1:2]), as.character))
+both2 <- inner_join(fix(tx2), fix(ct2), by = key3)
+
+tibble(
+  tx_keys          = nrow(tx2),
+  joined_keys      = nrow(both2),
+  pct_tx_joined    = round(100 * sum(both2$n_transactions) /
+                                 sum(tx2$n_transactions), 1),
+  pct_one_to_one   = round(100 * mean(both2$n_contract_rows == 1), 1),
+  pct_tx_with_rate = round(100 *
+    sum(both2$n_transactions[both2$n_with_rate > 0]) /
+    sum(tx2$n_transactions), 1)) |>
+  kable(caption = "Joining transactions to contracts on seller, agreement ID and product.")
+```
+
+That table says the join works. 14,360 of the 14,895 key combinations match, and
+because the ones that fail are small, 99.9% of all 143 million transaction rows
+land on a contract filed in the same quarter. Adding the product to the key also
+pushed one-to-one matching from 57% up to 82.7%, which confirms that the
+fan-out was line splitting and not a defect in the key.
+
+A mechanical match is not the same as a correct one though, and with numbers
+this clean I wanted an independent check that the contracts being picked out are
+really the contracts those sales happened under. The way to test that is price.
+If the join is finding the right agreement, then the price written into the
+contract should roughly match the prices actually realized on the transactions
+underneath it, and there is no reason a coincidental match would produce that.
+
+```{r price-validation}
+# Only contracts I can compare cleanly: energy sales, priced in one unit, with
+# a non-zero rate. Averaging across rate_units would be meaningless (Section 5).
+ct_price <- dbGetQuery(con, sprintf("
+  SELECT seller_company_id_ferc, contract_service_agreement_id, product_name,
+         round(avg(rate), 2) AS contract_rate
+    FROM read_parquet('%s')
+   WHERE rate > 0 AND rate_units = '$/MWH' AND product_name = 'ENERGY'
+   GROUP BY 1, 2, 3", c_url))
+
+nrow(ct_price)   # how many keys the comparison can use at all
+
+# Hand that small table to DuckDB so the join runs inside the database rather
+# than pulling 143 million rows into R.
+duckdb_register(con, "ck", ct_price)
+
+tx_price <- dbGetQuery(con, sprintf("
+  SELECT t.seller_company_id_ferc,
+         t.contract_service_agreement_id,
+         t.product_name,
+         count(*)                               AS n_tx,
+         round(median(t.standardized_price), 2) AS realized_med
+    FROM read_parquet('%s') t
+    JOIN ck k
+      ON t.seller_company_id_ferc        = k.seller_company_id_ferc
+     AND t.contract_service_agreement_id = k.contract_service_agreement_id
+     AND t.product_name                  = k.product_name
+   -- Trim the tails established in Section 5, and keep deliveries only.
+   WHERE t.standardized_price BETWEEN 0 AND 1000
+     AND t.standardized_quantity > 0
+   GROUP BY 1, 2, 3", t_url))
+
+compare <- inner_join(tx_price, ct_price, by = key3) |>
+  filter(realized_med > 0) |>
+  mutate(ratio = realized_med / contract_rate)
+
+tibble(
+  n_keys        = nrow(compare),
+  med_contract  = round(median(compare$contract_rate), 2),
+  med_realized  = round(median(compare$realized_med), 2),
+  med_ratio     = round(median(compare$ratio), 2),
+  pct_within_25 = round(100 * mean(compare$ratio > 0.75 &
+                                   compare$ratio < 1.25), 1)) |>
+  kable(caption = "Contracted price against realized transaction price for the same key.")
+```
+
+3,393 contract keys meet the conditions and 3,048 of them have matching
+transactions. Across those, the median contracted price is $34.60 per megawatt
+hour and the median realized price is $34.34, giving a median ratio of exactly
+1, and 94.9% of keys land within 25% of their contracted price. I did not
+expect agreement that close. A mechanical key match could happen by accident,
+but three thousand independent agreements each producing a realized price
+within a few percent of what the contract says is not something coincidence
+produces, so I am treating this as confirmation that the join is
+right and not just structurally valid.
+
+The honest limits are worth stating clearly. Only 23.2% of transaction volume
+lands on a contract that carries a price at all, since most of the volume sits
+under RTO market participation agreements where the contract has no rate and
+there is nothing to compare. The price validation therefore runs on a slice of
+the data rather than all of it. And everything here is one quarter. The
+corresponding check on 2018 Q3 is written but has not been run yet, and until
+it has I would describe this as a result for 2024 Q1 rather than a property of
+the dataset. **[TO RUN]** The earlier-quarter check.
+
+## Matching EQR sellers to EIA utilities
+
+The EQR identifies a seller by a FERC company ID and a free-text name and
+nothing else. There is no plant identifier, no location, and no link to any
+other federal dataset, so you can see that a company sold power without knowing
+what it owns or where it operates. My advisor suggested trying to close that
+gap by matching seller names against EIA's utility records, which would give
+access to capacity, technology and plant coordinates.
+
+The approach is a normalization ladder: apply progressively more aggressive
+cleaning to both sides and see how the match rate responds. The important rule
+is that both name lists go through the identical function, since a match only
+means something if the two names were transformed the same way.
+
+```{r crosswalk}
+# EQR sellers for the quarter, with a row count so matches can be weighted by
+# how much of the data each seller accounts for.
+eqr_sellers <- dbGetQuery(con, sprintf("
+  SELECT seller_company_id_ferc, seller_company_name, count(*) AS n_rows
+    FROM read_parquet('%s')
+   WHERE seller_company_name IS NOT NULL
+   GROUP BY 1, 2", c_url))
+
+# Every utility EIA knows about. This table is not partitioned by quarter.
+eia_utils <- dbGetQuery(con, sprintf("
+  SELECT DISTINCT utility_id_eia, utility_name_eia
+    FROM read_parquet('%s')
+   WHERE utility_name_eia IS NOT NULL", pudl("core_eia__entity_utilities")))
+
+# Four levels, each more aggressive than the last.
+norm1 <- function(x) str_squish(str_to_upper(x))                 # case, spaces
+norm2 <- function(x) str_squish(str_replace_all(norm1(x),         # punctuation
+                                                "[^A-Z0-9 ]", " "))
+SUFFIX <- "\\b(LLC|L L C|LP|LLP|INC|INCORPORATED|CO|CORP|CORPORATION|COMPANY|LTD|LIMITED|PLC|HOLDINGS?)\\b"
+norm3 <- function(x) str_squish(str_remove_all(norm2(x), SUFFIX)) # corp suffix
+FILLER <- "\\b(THE|OF|AND|ELECTRIC|POWER|ENERGY|UTILITIES|UTILITY|SERVICES?|GENERATION|MARKETING|RESOURCES)\\b"
+norm4 <- function(x) str_squish(str_remove_all(norm3(x), FILLER)) # filler words
+
+for (nm in c("L1", "L2", "L3", "L4")) {
+  f <- get(paste0("norm", substr(nm, 2, 2)))
+  eqr_sellers[[nm]] <- f(eqr_sellers$seller_company_name)
+  eia_utils[[nm]]   <- f(eia_utils$utility_name_eia)
+}
+
+# Two rates per level, because they answer different questions. pct_sellers is
+# about companies; pct_rows is about how much of the table gets covered.
+match_at <- function(level) {
+  hit <- eqr_sellers[[level]] %in% eia_utils[[level]]
+  tibble(level       = level,
+         n_matched   = sum(hit),
+         pct_sellers = round(100 * mean(hit), 1),
+         pct_rows    = round(100 * sum(eqr_sellers$n_rows[hit]) /
+                                   sum(eqr_sellers$n_rows), 1))
+}
+
+bind_rows(lapply(c("L1", "L2", "L3", "L4"), match_at)) |>
+  kable(caption = "Match rate between 2,760 EQR seller names and 17,498 EIA utility names at four levels of normalization.")
+```
+
+The table above shows the ladder flattening out. Matching on case and whitespace alone
+gets 30.9% of sellers, stripping punctuation gets 43.6%, and stripping
+corporate suffixes gets 50.7%, which is the single largest jump and reflects
+how often the same company is "Duke Energy Carolinas, LLC" in one dataset and
+"Duke Energy Carolinas LLC" in the other. The fourth level, which removes
+filler words like ENERGY and POWER, buys only another 2.6 percentage points
+and starts doing real damage: at that level eleven distinct EIA utilities
+collapse onto INTERNATIONAL PAPER and ten onto CALPINE, so any match made there
+is a coin flip. I stop at level three for everything that follows.
+
+A 50.7% match rate initially looked like a failure of the method, but sorting
+the unmatched sellers by size suggested otherwise. The largest misses are Tri-
+State Generation and Transmission, Bonneville Power Administration, MISO,
+CAISO, SPP, and a long list of pure trading companies like NextEra Energy
+Marketing and Shell Energy North America. None of those are name problems.
+Market operators, federal power marketing agencies and traders do not own
+generators, so they are not in EIA-860 and never could be. That suggested the
+match rate is really a property of what kind of company is filing, which is
+testable.
+
+```{r crosswalk-strata}
+# Classify each seller by what they actually sold. A unit power sale is power
+# from specific named generating units, which is strong evidence of ownership.
+seller_type <- dbGetQuery(con, sprintf("
+  SELECT seller_company_id_ferc, seller_company_name,
+         max(CASE WHEN class_name = 'UP' THEN 1 ELSE 0 END) AS unit_power,
+         max(CASE WHEN product_name IN ('ENERGY','CAPACITY')
+                  THEN 1 ELSE 0 END)                        AS energy_cap,
+         max(CASE WHEN product_name IN
+             ('POINT-TO-POINT AGREEMENT','NETWORK','INTERCONNECTION AGREEMENT',
+              'TRANSMISSION OWNERS AGREEMENT','NETWORK OPERATING AGREEMENT')
+                  THEN 1 ELSE 0 END)                        AS transmission
+    FROM read_parquet('%s')
+   WHERE seller_company_name IS NOT NULL
+   GROUP BY 1, 2", c_url))
+
+seller_type <- seller_type |>
+  mutate(
+    # RTOs and ISOs are market operators, not utilities. They will never be in
+    # EIA-860, so they should be identified rather than counted as misses.
+    is_rto = str_detect(seller_company_name,
+      regex(paste("independent system operator", "interconnection, l",
+                  "power pool", "ISO New England", "Midcontinent",
+                  sep = "|"), ignore_case = TRUE)),
+    category = case_when(
+      is_rto            ~ "RTO / ISO",
+      unit_power   == 1 ~ "Sells unit power (owns plants)",
+      energy_cap   == 1 ~ "Sells energy or capacity",
+      transmission == 1 ~ "Transmission only",
+      TRUE              ~ "Other"),
+    L3 = norm3(seller_company_name))
+
+seller_type |>
+  group_by(category) |>
+  summarise(n_sellers = n(),
+            matched   = sum(L3 %in% eia_utils$L3),
+            pct       = round(100 * mean(L3 %in% eia_utils$L3), 1),
+            .groups   = "drop") |>
+  arrange(desc(n_sellers)) |>
+  kable(caption = "Match rate against EIA utilities, by what the seller actually sells.")
+```
+
+That last table is the result I would keep if I could only keep one from this example.
+Sellers that make unit power sales, meaning power from specific named
+generating units, match 58.1% of the time. Sellers of generic energy or
+capacity match 47.3%. Transmission-only sellers match 11.1% and RTOs match
+5.6%. The match rate is not really telling you how good the string matching
+is, it is telling you whether the company owns generators, which is exactly
+what determines whether EIA has heard of it.
+
+One caveat on how the table is built. The RTO group is identified by pattern
+matching on company names rather than by anything recorded in the data, and
+the line between "transmission only" and "other" depends on which product
+names I chose to list, so both are judgment calls I made rather than
+categories the EQR provides. The headline result is not sensitive to that,
+since unit power sellers match roughly ten times as often as RTOs either way,
+but the individual percentages would shift a little under a different set of
+rules.
+
+Two further checks are worth mentioning briefly. Of the sellers that do match,
+93.6% map to exactly one EIA utility rather than several, so the matches are
+mostly unambiguous. And for those where a plant fleet could be pulled from
+EIA's generator table, the balancing authority of the plants agreed with the
+balancing authority the contracts deliver into for 87.9% of unit power
+sellers, which is an independent check that does not use names at all.
+
+
+# An Interactive Tool
+
+**[Not yet drafted. Scope still to be discussed.]**
+
+*A potential dashboard for exploring contract trends by region, date range and contract
+type without writing code, built for policymakers, industry analysts and the
+public.*
+
+# Ethical Considerations
+
+Most of this project is methodological, but making a dataset easier to use is not always necessarily an ethically neutral act. Three main issues came up, and I will go over how I delt with each.
+
+## Personal information in the filer identity table
+
+One of the four EQR tables, `quarterly_identity`, is a directory of the people who submit filings. It contains named individuals with their work email addresses, phone numbers, and street addresses. There are hundreds of thousands of these records across the full history.
+
+This information is lawfully public and required by the FERC. That does not mean it is appropriate for me to reproduce it. The people listed are mostly mid-level compliance staff who provided a contact for a regulatory filing, not public figures who consented to scrutinty. 
+
+I handled this by using the identity table only at the company level. Every query I ran against it returns company identifiers and company names, and none of the output in this document includes a contact name, email, phone number or street address. The one place I used a contact-level field was `contact_state`, and I used it only in aggregate, to show that it is a mailing address rather than geography. I also do not redistribute any of the data. A reader who wants it goes to PUDL, which is where I got it.
+
+## Commercially sensitive pricing
+
+The transactions table records what specific companies charged specific buyers for specific products. That is competitively sensitive information by any ordinary standard, and the point of this project is to make it easier to analyze.
+
+The standard worry about price transparency in concentrated markets is that it can facilitate tacit coordination. If sellers can observe what rivals charged and to whom, they can stop undercutting each other without ever communicating. Buyers pay more, and so do the retail customers downstream. This is not hypothetical in wholesale electricity, where the California crisis of 2000 and 2001 was driven partly by "a combination of real scarcity and generator market power" [@borenstein2015restructuring, p. 8].
+
+What makes me comfortable proceeding is that this decision was made deliberately, and not by me.
+
+FERC considered exactly how much detail to require and rejected aggregation on statutory grounds. In Order No. 2001-A the Commission concluded that "aggregated data do not provide sufficient disclosure of rates to the public" and that "section 205(c) does not allow the aggregation of this information" [@ferc2023filing, p. 26]. The operational rule follows from that: "Transaction data may not be aggregated. If the price changes even on a sub-hourly basis, a new line of transaction data must be reported for each price change; the prices cannot be averaged" [@ferc2023filing, p. 26].
+
+So the transaction-level granularity that creates the concern is not an accident of the data format. It is the deliberate product of a rulemaking in which the Commission decided that public disclosure of individual wholesale rates is what the Federal Power Act requires. I am lowering the effort needed to read data that FERC chose to publish for exactly this purpose.
+
+The realistic effect of this project is to narrow the gap between parties who can already afford commercial services built on this data and researchers, regulators and smaller participants who cannot. I think that cuts in favor of doing it, and I would rather state the reasoning than assume it.
+
+## The responsibility of writing a guide
+
+PUDL has documented this dataset's structure. There is a field catalog, access instructions in four languages, a tutorial notebook, and a public list of known problems. What does not readily exist is an account of what the data means: what a row represents, that contracts are re-reported every quarter, how the two main tables relate to each other, or which fields actually hold up under use. PUDL did characterize the tables internally, but that work sits in closed issues on their tracker rather than anywhere a new user would find it, and all four tables are still labeled "experimental and/or a work in progress."
+
+That puts this document in an awkward position. For questions about schema, a reader can check me against PUDL. For the semantic claims, which are the ones that actually determine whether an analysis is right, there is nothing to check me against. If I am wrong, a reader inherits the error with no obvious way to catch it.
+
+I have handled this by marking uncertainty throughout. Claims I verified are stated plainly, claims I believe but have not confirmed carry a marker, and open questions are listed rather than smoothed over. Where I disagree with PUDL's documentation or FERC's own materials, I say which source I am following and why. I would rather this document be visibly incomplete than quietly wrong.
+
+# Limitations and Future Work
+
+## What the dataset cannot do
+
+The most obvious gap is that the EQR has no plant identifier and no location. A
+contract tells you that a company sold power and where it was delivered, but
+nothing about what generated it or where that generator sits. The crosswalk in
+Section 6 closes part of that gap by matching sellers to EIA utilities, which
+then gives access to plant coordinates and capacity, but it reaches only 20.7%
+of contract rows with fleet data attached. For the other four fifths the
+question stays unanswerable with this dataset alone.
+
+The second gap is on the buyer side. Sellers are identified by a FERC company
+ID, but buyers appear only as a free-text name with no identifier of any kind.
+That rules out anything that requires tracking a buyer across contracts or
+across sellers, and it also means the buyer side cannot be crosswalked to EIA
+the way the seller side can, since there is no stable key to anchor the match
+to. Of everything missing from the EQR, this is the one I would most want back.
+
+Price coverage is narrower than it first appears. 52.9% of contract rows carry
+a rate at all, and once you require that rate to be in a single interpretable
+unit, only 23.2% of transaction volume connects to a contract with a usable
+price. Any study of contracted prices in the EQR is working inside that
+fraction, and it is not a random fraction, since it skews toward energy and
+capacity sales and away from transmission and market participation agreements.
+
+ERCOT is effectively absent. Because most activity inside ERCOT is intrastate
+and therefore outside FERC's jurisdiction over wholesale sales, Texas shows up
+in the EQR only at the margins, and ERCOT does not appear anywhere in the
+twenty-five largest delivery regions in Section 6. Anyone who needs ERCOT has to
+go to ERCOT's own published data instead. Retail sales are out of scope
+entirely for the same jurisdictional reason, so the EQR says nothing about what
+end-use customers pay.
+
+## Questions I was able to close
+
+Two things I expected to list as limitations turned out not to be. An earlier
+version of this draft stated that contracts could not be joined to transactions
+and that the EQR could not be linked to other energy datasets. Section 6 shows
+that both are wrong. The contract service agreement ID does link the two tables
+when it is combined with the seller ID and the product name, and seller names
+do match EIA utility names often enough to be useful for the subset of sellers
+that own generators. I have left this paragraph in rather than quietly deleting
+the old claim, because being wrong about what the data could do was itself a
+consequence of there being no documentation, which is the thing this project is
+about.
+
+## What remains open
+
+The largest unfinished piece is contract duration. The contracts table has
+execution, commencement and termination dates, and a straightforward duration
+calculation produced 90th-percentile contract lengths above a century while
+silently dropping two thirds of the rows. That pattern almost certainly means
+one or more sentinel values are being used in the date fields, but I have not
+identified them, so I have left any analysis of contract length out of the
+guide. Profiling the fill rates and the most common termination dates would
+probably resolve it quickly, and it would unlock what I think is the single
+most interesting question the EQR can answer, which is how the term structure
+of wholesale contracting has changed over the thirteen years of data.
+
+Related to that, almost everything in this guide runs on a single quarter. The
+de-duplication recipe in Section 5 is demonstrated on three quarters and the
+join in Section 6 on one, so none of the findings here are established as
+properties of the dataset across its full span. **[TO RUN]** The 2018 Q3
+version of the join is written and not yet run, and it would be the first step
+toward that.
+
+Two smaller items. I have not confirmed what negative quantities in the
+transactions table actually represent, only that they are concentrated in
+market settlement rows and absent from fixed-price bilateral rows. And the EIA
+crosswalk stops at exact matching after normalization, so the genuine
+near-misses that fuzzy matching would recover are still on the table, though
+Section 6 argues that residual is small compared to the structural
+non-matches.
+
+## A regime that is closing
+
+Everything described in this guide documents a filing regime that FERC is in
+the process of replacing. On 19 March 2026 the Commission issued Order No. 917
+in Docket RM23-9-000, published at 91 FR 14306 and effective 26 May 2026
+[@ferc2026order917].
+
+The headline change is a format change. The order adopts XBRL-CSV as the single
+standard for EQR filing, replacing the three existing submission methods, which
+are XML, CSV and manual entry through a webform. It also extends the filing
+window from one month to four months after the end of the quarter, although the
+Commission states that this will not take effect until the new XBRL-CSV system
+is operational, and the implementation timeline itself is deferred to a future
+order adopting the EQR taxonomies.
+
+More consequential for anyone doing the kind of work in this guide, the final
+rule eliminates three reporting requirements outright. Sellers will no longer
+report transmission capacity reassignment information, will no longer identify
+the index price publishers to which they report transactions, and will no
+longer identify the exchange or broker used to consummate a transaction. The
+order also adopts new data fields and clarifies the definitions of existing
+ones, though the summary language does not name them.
+
+Two of those eliminations land directly on things used in this project. PUDL's
+`core_ferceqr__quarterly_index_pub` table exists to hold index publisher
+reporting, so that table has an end date. And `exchange_brokerage_service` is a
+column in the transactions table today that will stop being populated, which
+removes the only field that says anything about how a bilateral trade was
+arranged. Both are worth knowing before building anything that depends on them.
+
+One change cuts the other way and is good news for the problem in Section 5.
+The order requires refiling for up to twelve quarters when there are material
+corrections or omissions, which formalizes the restatement behavior that makes
+naive multi-quarter aggregation wrong. It does not remove the need to
+de-duplicate, but it does put a boundary on how far back a contract can be
+restated, which at least makes the problem a bounded one.
+
+**[CHECK]** My bibliography currently cites this order as 194 FERC ¶ 61,195. I
+confirmed the Federal Register citation, the docket, the effective date and the
+field eliminations directly from the Federal Register text, but I could not
+confirm that paragraph number, so I should either verify it against the order
+itself or cite 91 FR 14306 instead.
+
+
+```{r cleanup}
+#| echo: false
+#| cache: false
+dbDisconnect(con, shutdown = TRUE)
+```
+
+# References {.unnumbered}
+
+::: {#refs}
+:::
